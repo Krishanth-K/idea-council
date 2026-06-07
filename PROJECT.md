@@ -5,11 +5,11 @@ A council of (local) ai agents that find scrape potential project ideas from onl
 ## Features
 
 - Multi source scraping pipeline:
-    - GitHub Trending
-    - HN
-    - arXiv
-    - Reddit
-    - DEV.to
+    GitHub — official REST API, free tier is generous (60 req/hr unauth, 5000 auth)
+    HN — official Algolia API, completely free, no key
+    Reddit — official API, needs key (and has gotten restrictive lately)
+    arXiv — official API, free, no key
+    DEV.to — official API, free, no key
 
 - Structured multi-agent debate with defined roles: Researcher, Proposer, Critic, Resume Judge, Moderater
 - CLI system to trigger runs, scrape ideas, and debate the ideas
