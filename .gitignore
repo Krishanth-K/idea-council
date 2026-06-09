@@ -45,6 +45,7 @@ Thumbs.db
 *.sqlite
 *.sqlite3
 *.log
+STRESS_TEST.md
 
 # Ollama models (large, typically excluded)
 ollama/
