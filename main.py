@@ -4,7 +4,7 @@ from council.scrape.hn import scrape_hn
 from council.scrape.devto import scrape_devto
 
 # print("arxiv: ")
-pprint(scrape_arxiv()[0])
+# pprint(scrape_arxiv()[0])
 #
 #
 # print("devto: ")
@@ -13,3 +13,4 @@ pprint(scrape_arxiv()[0])
 #
 # print("hn: ")
 # print(scrape_hn())
+
