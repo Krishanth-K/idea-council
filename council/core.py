@@ -1,10 +1,19 @@
+import os
+from dotenv import load_dotenv
 from pprint import pprint
 from ollama import Client
 from council.Agent import Agent
 
+
 def call_llm(idea: str, agent: Agent) -> str:
-    # ollama client
-    client = Client()
+
+    load_dotenv()
+    OLLAMA_API_KEY = os.getenv('OLLAMA_API_KEY')
+
+    client = Client(
+        host='https://ollama.com',
+        headers={'Authorization': f'Bearer {OLLAMA_API_KEY}'}
+    )
 
     messages = [
       {
@@ -18,7 +27,7 @@ def call_llm(idea: str, agent: Agent) -> str:
     ]
 
     response = ""
-    for part in client.chat('llama3.2:1b', messages=messages, stream=True):
+    for part in client.chat('minimax-m3:cloud', messages=messages, stream=True):
         message = part.message.content or ""
 
         # print(message, end='', flush=True)
