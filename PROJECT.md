@@ -85,6 +85,7 @@ A council of local AI agents that scrape real signals from the internet, debate 
 - Dedup: SHA256 hash of `url` checked against `seen_signals` table before passing forward.
 - Target: ~30–50 fresh signals per full scrape run across all 5 sources.
 
+
 ### API endpoints
 
 | Source | Endpoint | Auth | What to extract |
@@ -94,6 +95,7 @@ A council of local AI agents that scrape real signals from the internet, debate 
 | arXiv | `https://export.arxiv.org/api/query?search_query=cat:cs.CV&sortBy=submittedDate` | None | title, summary (first 300 chars) |
 | DEV.to | `https://dev.to/api/articles?top=7` | None | title, description, tag_list |
 | Lobste.rs | `https://lobste.rs/hottest.json` | None | title, description, tags |
+
 
 ### arXiv categories to query
 ```
