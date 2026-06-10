@@ -68,3 +68,4 @@ htmlcov/
 dmypy.json
 
 pyrightconfig.json
+*_response.md
