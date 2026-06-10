@@ -1,11 +1,12 @@
 import httpx
 from typing import Any, Dict, List
 
-def scrape_devto(per_page: int = 30) -> List[Dict[str, Any]]:
+def scrape_devto(per_page: int = 30) -> List[Dict[str, Any]]: 
     """
     Scrapes DEV.to for recent articles using their official API.
     Returns a list of dictionaries containing title, url, tags, and description.
     """
+
     url = "https://dev.to/api/articles"
     params = {
         "per_page": per_page
@@ -43,3 +44,5 @@ if __name__ == "__main__":
     data = scrape_devto(per_page=5)
     print(json.dumps(data, indent=2))
     print(f"Total items scraped: {len(data)}")
+
+

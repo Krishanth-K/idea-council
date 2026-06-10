@@ -36,14 +36,15 @@ def scrape_arxiv(categories: List[str] = None, max_results: int = 30) -> List[Di
             published = entry.find("atom:published", ns).text.strip()
 
             # Truncate blurb to ~200 characters
-            blurb = summary[:200] + "..." if len(summary) > 200 else summary
+            # blurb = summary[:200] + "..." if len(summary) > 200 else summary
 
             results.append({
                 "source": "arXiv",
                 "title": title,
                 "url": link,
-                "blurb": blurb,
-                "scraped_at": published
+                # "blurb": blurb,
+                "scraped_at": published,
+                "summary": summary
             })
 
     except Exception as e:
@@ -53,6 +54,6 @@ def scrape_arxiv(categories: List[str] = None, max_results: int = 30) -> List[Di
 
 if __name__ == "__main__":
     import json
-    data = scrape_arxiv(max_results=5)
+    data = scrape_arxiv(max_results=15)
     print(json.dumps(data, indent=2))
     print(f"Total items scraped: {len(data)}")
