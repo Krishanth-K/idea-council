@@ -4,7 +4,7 @@ from council.core import call_llm
 from council.scrape.arxiv import scrape_arxiv
 from council.scrape.hn import scrape_hn
 from council.scrape.devto import scrape_devto
-from council.utils import write_to_file
+from council.utils import parse_critique_response, append_to_file
 
 # print("arxiv: ")
 # pprint(scrape_arxiv()[0])
@@ -128,15 +128,28 @@ Do not explain the JSON. Do not add anything after the closing ```.
 ideator = Agent(IDEATOR_PROMPT)
 critique_lawyer = Agent(CRITIQUE_LAWYER_PROMPT)
 
-data = scrape_arxiv()
-summary = data[0]["summary"]
+data = scrape_arxiv(max_results=100)
 
-idea = call_llm(summary, ideator)
-response = call_llm(idea, critique_lawyer)
+for entry in data:
+    summary = entry["summary"]
 
-write_to_file("scrape_response.md", summary)
-write_to_file("ideator_response.md", idea)
-write_to_file("critique_response.md", response)
+    idea = call_llm(summary, ideator)
+    response = call_llm(idea, critique_lawyer)
+
+    data_dict, parsed_summary = parse_critique_response(response)
+
+    if data_dict and "score" in data_dict:
+        if data_dict["score"] >= 5:
+            append_to_file("results.md", idea + '\n' + summary + '\n\n\n\n\n')
+    else:
+        print("Warning: Could not extract score from response.")
+
+# write_to_file("scrape_response.md", summary)
+# write_to_file("ideator_response.md", idea)
+# write_to_file("critique_response.md", response)
+
+
+
 pprint(response)
 
 
