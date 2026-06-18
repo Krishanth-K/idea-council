@@ -1,156 +1,105 @@
-from pprint import pprint
-from council.Agent import Agent
-from council.core import call_llm
-from council.scrape.arxiv import scrape_arxiv
-from council.scrape.hn import scrape_hn
-from council.scrape.devto import scrape_devto
-from council.utils import parse_critique_response, append_to_file
+"""IdeaCouncil - CLI entry point."""
 
-# print("arxiv: ")
-# pprint(scrape_arxiv()[0])
-#
-#
-# print("devto: ")
-# print(scrape_devto())
-#
-#
-# print("hn: ")
-# print(scrape_hn())
+import typer
+from rich.console import Console
+from rich.table import Table
 
-IDEATOR_PROMPT = """
-You are the Ideator in a project idea evaluation council.
+from council.scrape import scrape_all, batch_signals
+from council.db import get_saved_ideas, init_db
 
-You will be given a batch of signals scraped from GitHub, Hacker News, arXiv, DEV.to,
-and Lobste.rs. Each signal is a title and a short blurb from the source.
-
-Your job is to read these signals, identify ONE interesting gap, niche, or underserved
-problem, and propose ONE concrete project that a solo developer can realistically build.
-
-WHAT MAKES A GOOD IDEA:
-- Grounded in a real signal from the batch — do not invent problems not represented
-- Targets a specific user, not "developers" or "everyone"
-- Has a clear, non-trivial technical core — not just glue code and API calls
-- A solo dev can ship a working prototype in 2–6 weeks
-- Has not been solved well by a widely-used, actively maintained tool
-
-WHAT TO AVOID:
-- "X but with AI" with no specific technical insight
-- Rebuilding something that already exists (VS Code extension, another RAG pipeline,
-  another chatbot wrapper)
-- Ideas so broad they require a team (distributed systems, full SaaS platforms)
-- Ideas so narrow they have no reuse or portfolio value
-- Anything that requires a large proprietary dataset to be useful at all
-
-HOW TO THINK (do this internally before writing output):
-1. Scan the full signal batch for a recurring theme, tension, or gap
-2. Ask: what problem does NO existing tool solve cleanly?
-3. Ask: what would a solo systems/CV/ML developer find technically interesting here?
-4. Narrow to ONE idea — do not propose multiple
-
-OUTPUT FORMAT:
-Respond with ONLY the following JSON. No preamble, no explanation, no text after.
-
-```json
-{
-  "title": "<short project name>",
-  "one_liner": "<one sentence, what it does and for whom>",
-  "target_user": "<specific person with a specific problem, not a broad category>",
-  "problem_it_solves": "<2–3 sentences: what pain exists today, why current tools fail>",
-  "core_technical_challenge": "<1–2 sentences: the hard part that makes this non-trivial>",
-  "source_signals": ["<signal title that inspired this>", "<second signal if relevant>"],
-  "estimated_scope": "<what a 2–6 week MVP looks like, one sentence>"
-}
-```
-
-If the signal batch is too weak or repetitive to produce a genuinely interesting idea,
-output this instead and nothing else:
-
-```json
-{ "skip": true, "reason": "<one sentence why the batch was insufficient>" }
-```
-"""
-
-CRITIQUE_LAWYER_PROMPT = """
-You are the Critique Lawyer in a project idea evaluation council.
-Your job is to critically examine a proposed project idea and probe its weaknesses.
-
-You are a BALANCED skeptic. You are not trying to kill every idea — you are trying to
-surface real problems that the builder will actually face. If something is strong,
-acknowledge it briefly. But your primary job is to find what breaks.
-
-Examine the idea across these four axes. Be specific — vague critiques like
-"this might be hard" are useless. Name the actual risk.
-
-1. ALREADY SOLVED — Does a well-maintained, widely-used solution already exist?
-   If yes, what is it, and what would this project need to do meaningfully differently?
-   A project that is "like X but slightly better" is not worth building.
-
-2. SOLO FEASIBILITY — What is the single hardest part of this for one developer?
-   Identify the most dangerous scope creep risk. Where is the project likely to stall?
-   Be specific about the technical bottleneck, not just "it's complex."
-
-3. REAL USE CASE — Who is the actual user? Is this solving a pain point someone
-   has TODAY, or is it a solution looking for a problem? If the user base is
-   "developers" or "everyone," that is a red flag — push for specificity.
-
-4. TECHNICAL RISK — Is the core technical challenge actually interesting, or is it
-   mostly integration work and glue code? Projects that are 90% calling APIs and
-   stitching libraries together have low technical depth and are hard to defend
-   in interviews.
-
-After your prose argument, output a JSON block with your score and a list of
-the weaknesses you found, ordered from most to least critical.
-
-OUTPUT FORMAT:
-First write your prose argument (4–8 sentences). Then end with exactly this JSON block:
-
-```json
-{
-  "score": <integer 1-10>,
-  "weaknesses": [
-    "<most critical weakness, one sentence>",
-    "<second weakness, one sentence>",
-    "<third weakness, one sentence>"
-  ],
-  "fatal": <true if solo_feasibility or already_solved is a dealbreaker, else false>
-}
-```
-
-Scoring guide for your score:
-1–3  → serious problems across multiple axes, unlikely worth building
-4–5  → real weaknesses but survivable with tight scoping
-6–7  → minor to moderate issues, buildable with awareness
-8–10 → very few weaknesses, do not inflate — a score above 7 from you is rare
-
-Do not explain the JSON. Do not add anything after the closing ```.
-"""
-
-ideator = Agent(IDEATOR_PROMPT)
-critique_lawyer = Agent(CRITIQUE_LAWYER_PROMPT)
-
-data = scrape_arxiv(max_results=100)
-
-for entry in data:
-    summary = entry["summary"]
-
-    idea = call_llm(summary, ideator)
-    response = call_llm(idea, critique_lawyer)
-
-    data_dict, parsed_summary = parse_critique_response(response)
-
-    if data_dict and "score" in data_dict:
-        if data_dict["score"] >= 5:
-            append_to_file("results.md", idea + '\n' + summary + '\n\n\n\n\n')
-    else:
-        print("Warning: Could not extract score from response.")
-
-# write_to_file("scrape_response.md", summary)
-# write_to_file("ideator_response.md", idea)
-# write_to_file("critique_response.md", response)
+app = typer.Typer()
+console = Console()
 
 
+@app.command()
+def scrape(
+    max_per_source: int = typer.Option(10, "--max", help="Max signals per source"),
+    preview: bool = typer.Option(True, "--preview/--no-preview", help="Show preview of signals"),
+):
+    """Scrape all sources and show results."""
+    console.print("[bold cyan]Scraping sources...[/bold cyan]")
+    signals = scrape_all(max_per_source=max_per_source)
 
-pprint(response)
+    console.print(f"[green]Got {len(signals)} signals[/green]")
+
+    if preview and signals:
+        console.print("\n[bold]Sample signals:[/bold]")
+        for sig in signals[:5]:
+            console.print(f"\n  [{sig.source}] {sig.title}")
+            console.print(f"    {sig.blurb[:100]}...")
+
+    # Also show the batched output
+    console.print("\n[bold]Batched output (first 800 chars):[/bold]")
+    console.print(batch_signals(signals[:10])[:800])
 
 
+@app.command()
+def list(
+    limit: int = typer.Option(20, "--limit", help="Max ideas to show"),
+):
+    """List saved ideas from the database."""
+    ideas = get_saved_ideas(limit=limit)
 
+    if not ideas:
+        console.print("[yellow]No saved ideas yet.[/yellow]")
+        return
+
+    table = Table(title="Saved Ideas")
+    table.add_column("ID", style="cyan")
+    table.add_column("Title", style="green")
+    table.add_column("Score", style="yellow")
+    table.add_column("Summary", style="white")
+
+    for idea in ideas:
+        table.add_row(
+            str(idea["id"]),
+            idea["title"][:30],
+            f"{idea['weighted_score']:.1f}",
+            idea["summary"][:50] if idea["summary"] else ""
+        )
+
+    console.print(table)
+
+
+@app.command()
+def init():
+    """Initialize the database."""
+    init_db()
+    console.print("[green]Database initialized![/green]")
+
+
+@app.command()
+def run(
+    cycles: int = typer.Option(1, "--cycles", "-n", help="Number of council cycles to run"),
+    max_signals: int = typer.Option(10, "--max-signals", help="Max signals per source"),
+):
+    """Run the full council cycle (scrape -> debate -> judge -> save)."""
+    from council.orchestrator import run_council_cycle
+    from council.scrape import scrape_all
+
+    console.print(f"[bold cyan]Running {cycles} council cycle(s)...[/bold cyan]")
+
+    for i in range(cycles):
+        console.print(f"\n[bold]Cycle {i + 1}/{cycles}[/bold]")
+
+        # Scrape signals
+        signals = scrape_all(max_per_source=max_signals)
+        if not signals:
+            console.print("[yellow]No signals scraped, skipping cycle.[/yellow]")
+            continue
+
+        # Run council cycle
+        verdict = run_council_cycle(signals)
+
+        if verdict is None:
+            console.print("[yellow]Idea was skipped (batch too weak).[/yellow]")
+        elif verdict.save:
+            console.print(f"[green]✓ Saved: {verdict.idea_title} (score: {verdict.weighted_score})[/green]")
+        else:
+            console.print(f"[red]✗ Rejected: {verdict.idea_title} (score: {verdict.weighted_score})[/red]")
+
+    console.print("\n[bold cyan]Done![/bold cyan]")
+
+
+if __name__ == "__main__":
+    app()
