@@ -38,10 +38,8 @@ const useStore = create((set, get) => ({
 
   // Connect to WebSocket
   connect: () => {
-    // In development, connect directly to backend; in production, use relative path
-    const wsUrl = import.meta.env.PROD
-      ? `wss://${window.location.host}/ws`
-      : `ws://localhost:8001/ws`
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+    const wsUrl = `${protocol}//${window.location.host}/ws`
     const ws = new WebSocket(wsUrl)
 
     ws.onopen = () => {
@@ -149,7 +147,7 @@ const useStore = create((set, get) => ({
           }],
           run: {
             ...state.run,
-            status: 'processing'
+            total_signals: state.run.total_signals + 1
           }
         })
         break
@@ -163,6 +161,7 @@ const useStore = create((set, get) => ({
           ),
           run: {
             ...state.run,
+            status: 'processing',
             current_signal_index: event.payload.signal_index || 0
           },
           activeCycle: {
@@ -366,7 +365,9 @@ const useStore = create((set, get) => ({
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ max_signals: maxSignals })
     })
-    return response.json()
+    const data = await response.json()
+    await get().fetchState()
+    return data
   },
 
   fetchState: async () => {
