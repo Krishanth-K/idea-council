@@ -69,3 +69,5 @@ dmypy.json
 
 pyrightconfig.json
 *_response.md
+
+**/node_modules/*

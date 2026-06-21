@@ -1,0 +1,8 @@
+httpx
+ollama
+python-dotenv
+rich
+typer
+fastapi
+uvicorn
+sse-starlette
