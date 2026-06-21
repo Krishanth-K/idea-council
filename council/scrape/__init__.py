@@ -14,11 +14,12 @@ from council.scrape.lobsters import scrape_lobsters
 
 def dict_to_signal(d: dict) -> Signal:
     """Convert a scraper dict to a Signal dataclass."""
+    blurb = d.get("blurb") or d.get("summary") or ""
     return Signal(
         source=d.get("source", "unknown"),
         title=d.get("title", ""),
         url=d.get("url", ""),
-        blurb=d.get("blurb", ""),
+        blurb=blurb,
         scraped_at=d.get("scraped_at", "")
     )
 

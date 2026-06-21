@@ -115,7 +115,7 @@ class Verdict:
         # Save threshold
         if self.weighted_score >= self.SAVE_THRESHOLD:
             self.save = True
-            return False
+            return True
 
         self.save = False
         return False

@@ -35,14 +35,13 @@ def scrape_arxiv(categories: List[str] = None, max_results: int = 30) -> List[Di
             summary = entry.find("atom:summary", ns).text.strip().replace("\n", " ")
             published = entry.find("atom:published", ns).text.strip()
 
-            # Truncate blurb to ~200 characters
-            # blurb = summary[:200] + "..." if len(summary) > 200 else summary
+            blurb = summary[:300] + "..." if len(summary) > 300 else summary
 
             results.append({
                 "source": "arXiv",
                 "title": title,
                 "url": link,
-                # "blurb": blurb,
+                "blurb": blurb,
                 "scraped_at": published,
                 "summary": summary
             })

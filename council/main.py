@@ -7,6 +7,7 @@ from rich.table import Table
 from council.scrape import scrape_all, batch_signals
 from council.db import get_saved_ideas, init_db
 
+
 app = typer.Typer()
 console = Console()
 
@@ -88,15 +89,13 @@ def run(
             console.print("[yellow]No signals scraped, skipping cycle.[/yellow]")
             continue
 
-        # Run council cycle
-        verdict = run_council_cycle(signals)
+        console.print(f"[cyan]Processing {len(signals)} signals...[/cyan]")
 
-        if verdict is None:
-            console.print("[yellow]Idea was skipped (batch too weak).[/yellow]")
-        elif verdict.save:
-            console.print(f"[green]✓ Saved: {verdict.idea_title} (score: {verdict.weighted_score})[/green]")
-        else:
-            console.print(f"[red]✗ Rejected: {verdict.idea_title} (score: {verdict.weighted_score})[/red]")
+        # Run council cycle (one idea per signal)
+        verdicts = run_council_cycle(signals)
+
+        saved = sum(1 for v in verdicts if v and v.save)
+        console.print(f"\n[bold]Cycle {i + 1} complete: {saved}/{len(signals)} ideas saved[/bold]")
 
     console.print("\n[bold cyan]Done![/bold cyan]")
 

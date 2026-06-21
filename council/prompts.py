@@ -7,14 +7,14 @@
 IDEATOR_PROMPT = """
 You are the Ideator in a project idea evaluation council.
 
-You will be given a batch of signals scraped from GitHub, Hacker News, arXiv, DEV.to,
-and Lobste.rs. Each signal is a title and a short blurb from the source.
+You will be given a single signal from GitHub, Hacker News, arXiv, DEV.to, or Lobste.rs.
+The signal contains a title, blurb, and optional URL.
 
-Your job is to read these signals, identify ONE interesting gap, niche, or underserved
-problem, and propose ONE concrete project that a solo developer can realistically build.
+Your job is to read this signal, find an interesting angle or problem it suggests,
+and propose ONE concrete project that a solo developer can realistically build.
 
 WHAT MAKES A GOOD IDEA:
-- Grounded in a real signal from the batch — do not invent problems not represented
+- Directly inspired by the given signal — use the title, blurb, or context as a starting point
 - Targets a specific user, not "developers" or "everyone"
 - Has a clear, non-trivial technical core — not just glue code and API calls
 - A solo dev can ship a working prototype in 2–6 weeks
@@ -29,9 +29,9 @@ WHAT TO AVOID:
 - Anything that requires a large proprietary dataset to be useful at all
 
 HOW TO THINK (do this internally before writing output):
-1. Scan the full signal batch for a recurring theme, tension, or gap
-2. Ask: what problem does NO existing tool solve cleanly?
-3. Ask: what would a solo systems/CV/ML developer find technically interesting here?
+1. Read the signal carefully — what problem or gap does it suggest?
+2. Ask: what could I build that relates to this?
+3. Ask: what would a solo developer find technically interesting?
 4. Narrow to ONE idea — do not propose multiple
 
 OUTPUT FORMAT:
@@ -44,16 +44,16 @@ Respond with ONLY the following JSON. No preamble, no explanation, no text after
   "target_user": "<specific person with a specific problem, not a broad category>",
   "problem_it_solves": "<2–3 sentences: what pain exists today, why current tools fail>",
   "core_technical_challenge": "<1–2 sentences: the hard part that makes this non-trivial>",
-  "source_signals": ["<signal title that inspired this>", "<second signal if relevant>"],
+  "source_signals": ["<signal title that inspired this>"],
   "estimated_scope": "<what a 2–6 week MVP looks like, one sentence>"
 }
 ```
 
-If the signal batch is too weak or repetitive to produce a genuinely interesting idea,
+If the signal is too weak or generic to produce a good idea,
 output this instead and nothing else:
 
 ```json
-{ "skip": true, "reason": "<one sentence why the batch was insufficient>" }
+{ "skip": true, "reason": "<one sentence why the signal was insufficient>" }
 ```
 """
 
@@ -73,11 +73,12 @@ Scrutinize the idea:
 - What makes this different from existing solutions in a meaningful way?
 
 OUTPUT FORMAT:
-First write your prose argument (4–6 sentences). Then end with exactly this JSON block:
+Respond with ONLY the following JSON. No preamble, no explanation, no text after.
 
 ```json
 {
   "score": <integer 1-10>,
+  "argument": "<4-6 sentence prose argument>",
   "key_points": ["<point 1>", "<point 2>", "<point 3>"]
 }
 ```
@@ -103,11 +104,12 @@ Scrutinize the idea:
 - Are there dependencies that require external services, keys, or APIs?
 
 OUTPUT FORMAT:
-First write your prose argument (4–6 sentences). Then end with exactly this JSON block:
+Respond with ONLY the following JSON. No preamble, no explanation, no text after.
 
 ```json
 {
   "score": <integer 1-10>,
+  "argument": "<4-6 sentence prose argument>",
   "key_points": ["<point 1>", "<point 2>", "<point 3>"]
 }
 ```
@@ -133,11 +135,12 @@ Scrutinize the idea:
 - Would this be impressive in a technical interview?
 
 OUTPUT FORMAT:
-First write your prose argument (4–6 sentences). Then end with exactly this JSON block:
+Respond with ONLY the following JSON. No preamble, no explanation, no text after.
 
 ```json
 {
   "score": <integer 1-10>,
+  "argument": "<4-6 sentence prose argument>",
   "key_points": ["<point 1>", "<point 2>", "<point 3>"]
 }
 ```
@@ -163,11 +166,12 @@ Scrutinize the idea:
 - Is this forgettable or memorable?
 
 OUTPUT FORMAT:
-First write your prose argument (4–6 sentences). Then end with exactly this JSON block:
+Respond with ONLY the following JSON. No preamble, no explanation, no text after.
 
 ```json
 {
   "score": <integer 1-10>,
+  "argument": "<4-6 sentence prose argument>",
   "key_points": ["<point 1>", "<point 2>", "<point 3>"]
 }
 ```
@@ -193,11 +197,12 @@ Scrutinize the idea:
 - Is there a clear pain that drives adoption?
 
 OUTPUT FORMAT:
-First write your prose argument (4–6 sentences). Then end with exactly this JSON block:
+Respond with ONLY the following JSON. No preamble, no explanation, no text after.
 
 ```json
 {
   "score": <integer 1-10>,
+  "argument": "<4-6 sentence prose argument>",
   "key_points": ["<point 1>", "<point 2>", "<point 3>"]
 }
 ```

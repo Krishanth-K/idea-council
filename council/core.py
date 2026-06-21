@@ -9,6 +9,8 @@ import httpx
 from dotenv import load_dotenv
 
 
+load_dotenv()
+
 # Default model - can be overridden via environment variable
 DEFAULT_MODEL = os.getenv("LLM_MODEL", "qwen2.5:14b")
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
@@ -32,6 +34,11 @@ def call_llm(system: str, user: str, model: Optional[str] = None) -> str:
 
     # Check if using remote Ollama or local
     if OLLAMA_HOST.startswith("http"):
+        api_key = os.getenv("OLLAMA_API_KEY", "")
+        headers = {}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+
         client = httpx.Client(timeout=300.0)
         response = client.post(
             f"{OLLAMA_HOST}/api/chat",
@@ -43,6 +50,7 @@ def call_llm(system: str, user: str, model: Optional[str] = None) -> str:
                 ],
                 "stream": False,
             },
+            headers=headers,
         )
         response.raise_for_status()
         return response.json()["message"]["content"]
