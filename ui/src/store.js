@@ -1,5 +1,35 @@
 import { create } from 'zustand'
 
+function resolveActiveCycle(state, event) {
+  if (state.activeCycle?.cycle_id === event.cycle_id) {
+    return state.activeCycle
+  }
+  if (!event.cycle_id) {
+    return state.activeCycle
+  }
+  const signal = state.signals.find(s => s.signal_id === event.signal_id)
+  return {
+    cycle_id: event.cycle_id,
+    signal_id: event.signal_id,
+    signal,
+    ideator: { status: 'waiting' },
+    round1: null,
+    round2: null,
+    judge: null
+  }
+}
+
+function patchActiveCycle(state, event, patch) {
+  const base = resolveActiveCycle(state, event)
+  if (!base) return {}
+  return {
+    activeCycle: {
+      ...base,
+      ...patch
+    }
+  }
+}
+
 const useStore = create((set, get) => ({
   // Run state
   run: {
@@ -35,34 +65,56 @@ const useStore = create((set, get) => ({
   // WebSocket connection
   ws: null,
   connected: false,
+  reconnectTimer: null,
+  reconnectDelay: 1000,
+  intentionalDisconnect: false,
 
   // Connect to WebSocket
   connect: () => {
+    const { ws, intentionalDisconnect } = get()
+    if (intentionalDisconnect) return
+    if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+      return
+    }
+
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
     const wsUrl = `${protocol}//${window.location.host}/ws`
-    const ws = new WebSocket(wsUrl)
+    const socket = new WebSocket(wsUrl)
 
-    ws.onopen = () => {
+    socket.onopen = () => {
       console.log('Connected to server')
-      set({ connected: true, ws })
+      set({ connected: true, ws: socket, reconnectDelay: 1000 })
+      get().fetchState()
     }
 
-    ws.onclose = () => {
+    socket.onclose = () => {
       console.log('Disconnected from server')
       set({ connected: false, ws: null })
+
+      const { intentionalDisconnect: closedOnPurpose, reconnectDelay } = get()
+      if (closedOnPurpose) return
+
+      const timer = setTimeout(() => {
+        set({ reconnectDelay: Math.min(reconnectDelay * 2, 30000) })
+        get().connect()
+      }, reconnectDelay)
+      set({ reconnectTimer: timer })
     }
 
-    ws.onmessage = (event) => {
+    socket.onmessage = (event) => {
       const data = JSON.parse(event.data)
       get().handleEvent(data)
     }
+
+    set({ ws: socket })
   },
 
   disconnect: () => {
-    const { ws } = get()
-    if (ws) {
-      ws.close()
-    }
+    const { ws, reconnectTimer } = get()
+    if (reconnectTimer) clearTimeout(reconnectTimer)
+    set({ intentionalDisconnect: true, reconnectTimer: null, reconnectDelay: 1000 })
+    if (ws) ws.close()
+    set({ connected: false, ws: null })
   },
 
   // Handle incoming events
@@ -85,6 +137,7 @@ const useStore = create((set, get) => ({
             error_count: 0
           },
           signals: [],
+          activeCycle: null,
           savedIdeas: [],
           rejectedIdeas: [],
           skippedSignals: [],
@@ -176,110 +229,177 @@ const useStore = create((set, get) => ({
         })
         break
 
-      case 'ideator_completed':
-        if (state.activeCycle) {
-          set({
-            activeCycle: {
-              ...state.activeCycle,
-              ideator: {
-                status: 'complete',
-                idea: event.payload.idea,
-                completed_at: event.timestamp
-              }
+      case 'ideator_started':
+        set(state => ({
+          ...patchActiveCycle(state, event, {
+            ideator: {
+              status: 'connecting',
+              provider: event.payload.provider,
+              host: event.payload.host,
+              model: event.payload.model,
+              started_at: event.timestamp
             }
           })
-        }
+        }))
+        break
+
+      case 'ideator_thinking':
+        set(state => {
+          const base = resolveActiveCycle(state, event)
+          if (!base) return {}
+          return {
+            activeCycle: {
+              ...base,
+              ideator: {
+                status: 'thinking',
+                provider: event.payload.provider,
+                host: event.payload.host,
+                model: event.payload.model,
+                started_at: base.ideator?.started_at || event.timestamp
+              }
+            }
+          }
+        })
+        break
+
+      case 'ideator_completed':
+        set(state => ({
+          ...patchActiveCycle(state, event, {
+            ideator: {
+              status: 'complete',
+              idea: event.payload.idea,
+              completed_at: event.timestamp
+            }
+          })
+        }))
+        break
+
+      case 'ideator_failed':
+        set(state => ({
+          ...patchActiveCycle(state, event, {
+            ideator: {
+              status: 'failed',
+              error: event.payload.error,
+              completed_at: event.timestamp
+            }
+          }),
+          signals: state.signals.map(s =>
+            s.signal_id === event.signal_id
+              ? { ...s, status: 'error' }
+              : s
+          ),
+          run: {
+            ...state.run,
+            error_count: state.run.error_count + 1
+          },
+          errors: [...state.errors, {
+            error_id: `${event.cycle_id}-ideator`,
+            stage: 'ideator',
+            message: event.payload.error
+          }]
+        }))
         break
 
       case 'ideator_skipped':
-        if (state.activeCycle) {
-          set({
-            activeCycle: {
-              ...state.activeCycle,
-              ideator: {
-                status: 'skipped',
-                skip_reason: event.payload.reason,
-                completed_at: event.timestamp
-              }
-            },
-            signals: state.signals.map(s =>
-              s.signal_id === event.signal_id
-                ? { ...s, status: 'skipped' }
-                : s
-            ),
-            run: {
-              ...state.run,
-              signals_processed: state.run.signals_processed + 1,
-              skipped_count: state.run.skipped_count + 1
+        set(state => ({
+          ...patchActiveCycle(state, event, {
+            ideator: {
+              status: 'skipped',
+              skip_reason: event.payload.reason,
+              completed_at: event.timestamp
             }
-          })
-        }
+          }),
+          signals: state.signals.map(s =>
+            s.signal_id === event.signal_id
+              ? { ...s, status: 'skipped' }
+              : s
+          ),
+          run: {
+            ...state.run,
+            signals_processed: state.run.signals_processed + 1,
+            skipped_count: state.run.skipped_count + 1
+          }
+        }))
         break
 
-      case 'round_started':
-        if (state.activeCycle) {
-          const round = event.payload.round === 1 ? 'round1' : 'round2'
-          set({
+      case 'round_started': {
+        const round = event.payload.round === 1 ? 'round1' : 'round2'
+        set(state => ({
+          ...patchActiveCycle(state, event, {
+            [round]: {
+              status: 'running',
+              lawyers: {},
+              started_at: event.timestamp
+            }
+          })
+        }))
+        break
+      }
+
+      case 'lawyer_completed': {
+        const round = event.payload.round === 1 ? 'round1' : 'round2'
+        set(state => {
+          const base = resolveActiveCycle(state, event)
+          if (!base) return {}
+          const currentRound = base[round] || { status: 'running', lawyers: {} }
+          return {
             activeCycle: {
-              ...state.activeCycle,
+              ...base,
               [round]: {
-                status: 'running',
-                lawyers: {},
-                started_at: event.timestamp
-              }
-            }
-          })
-        }
-        break
-
-      case 'lawyer_completed':
-        if (state.activeCycle) {
-          const round = event.payload.round === 1 ? 'round1' : 'round2'
-          const currentRound = state.activeCycle[round]
-
-          if (currentRound) {
-            set({
-              activeCycle: {
-                ...state.activeCycle,
-                [round]: {
-                  ...currentRound,
-                  lawyers: {
-                    ...currentRound.lawyers,
-                    [event.payload.dimension]: {
-                      ...(round === 'round1'
-                        ? {
-                            score: event.payload.score,
-                            argument: event.payload.argument,
-                            key_points: event.payload.key_points || []
-                          }
-                        : {
-                            original_score: event.payload.original_score,
-                            updated_score: event.payload.updated_score,
-                            rebuttal: event.payload.rebuttal
-                          }),
-                      status: 'complete'
-                    }
+                ...currentRound,
+                lawyers: {
+                  ...currentRound.lawyers,
+                  [event.payload.dimension]: {
+                    ...(round === 'round1'
+                      ? {
+                          score: event.payload.score,
+                          argument: event.payload.argument,
+                          key_points: event.payload.key_points || []
+                        }
+                      : {
+                          original_score: event.payload.original_score,
+                          updated_score: event.payload.updated_score,
+                          rebuttal: event.payload.rebuttal
+                        }),
+                    status: 'complete'
                   }
                 }
               }
-            })
+            }
           }
-        }
+        })
         break
+      }
 
       case 'judge_completed':
-        if (state.activeCycle) {
-          set({
-            activeCycle: {
-              ...state.activeCycle,
-              judge: {
-                status: 'complete',
-                verdict: event.payload.verdict,
-                completed_at: event.timestamp
-              }
+        set(state => ({
+          ...patchActiveCycle(state, event, {
+            judge: {
+              status: 'complete',
+              verdict: event.payload.verdict,
+              completed_at: event.timestamp
             }
           })
-        }
+        }))
+        break
+
+      case 'cycle_failed':
+        set(state => ({
+          signals: state.signals.map(s =>
+            s.signal_id === event.signal_id
+              ? { ...s, status: 'error' }
+              : s
+          ),
+          run: {
+            ...state.run,
+            error_count: state.run.error_count + 1
+          },
+          errors: [...state.errors, {
+            error_id: `${event.cycle_id}-${event.payload.stage}`,
+            stage: event.payload.stage,
+            message: event.payload.error
+          }]
+        }))
         break
 
       case 'verdict_saved':
@@ -349,7 +469,12 @@ const useStore = create((set, get) => ({
             ...state.run,
             status: 'failed',
             completed_at: event.timestamp
-          }
+          },
+          errors: [...state.errors, {
+            error_id: `${event.run_id}-run`,
+            stage: 'run',
+            message: event.payload.error
+          }]
         })
         break
 
@@ -365,15 +490,22 @@ const useStore = create((set, get) => ({
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ max_signals: maxSignals })
     })
-    const data = await response.json()
-    await get().fetchState()
-    return data
+    return response.json()
   },
 
   fetchState: async () => {
     const response = await fetch('/api/state')
     const data = await response.json()
-    set(data)
+    set({
+      run: data.run,
+      sources: data.sources,
+      signals: data.signals,
+      activeCycle: data.activeCycle,
+      savedIdeas: data.savedIdeas,
+      rejectedIdeas: data.rejectedIdeas,
+      skippedSignals: data.skippedSignals,
+      errors: data.errors
+    })
   }
 }))
 

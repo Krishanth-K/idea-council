@@ -1,4 +1,12 @@
 function IdeatorPanel({ ideator }) {
+  const renderLlmMeta = () => (
+    <div className="llm-meta">
+      <span>{ideator.provider || 'ollama'}</span>
+      <span>{ideator.model || 'model pending'}</span>
+      <span>{ideator.host || 'host pending'}</span>
+    </div>
+  )
+
   if (!ideator) {
     return (
       <div className="cycle-panel">
@@ -24,12 +32,59 @@ function IdeatorPanel({ ideator }) {
     )
   }
 
+  if (ideator.status === 'failed') {
+    return (
+      <div className="cycle-panel">
+        <div className="cycle-panel-header">Ideator</div>
+        <div className="cycle-panel-content">
+          <span className="status-badge error">Failed</span>
+          <div className="idea-field" style={{ marginTop: '12px' }}>
+            <div className="label">Error</div>
+            <div className="value">{ideator.error}</div>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  if (ideator.status === 'connecting') {
+    return (
+      <div className="cycle-panel">
+        <div className="cycle-panel-header">Ideator</div>
+        <div className="cycle-panel-content">
+          <span className="status-badge connecting">Connecting to LLM</span>
+          {renderLlmMeta()}
+        </div>
+      </div>
+    )
+  }
+
+  if (ideator.status === 'thinking') {
+    return (
+      <div className="cycle-panel">
+        <div className="cycle-panel-header">Ideator</div>
+        <div className="cycle-panel-content">
+          <div className="llm-thinking">
+            <span className="status-badge thinking">LLM Thinking</span>
+            <div className="llm-pulse" aria-hidden="true">
+              <span />
+              <span />
+              <span />
+              <span />
+            </div>
+          </div>
+          {renderLlmMeta()}
+        </div>
+      </div>
+    )
+  }
+
   if (ideator.status !== 'complete' || !ideator.idea) {
     return (
       <div className="cycle-panel">
         <div className="cycle-panel-header">Ideator</div>
         <div className="cycle-panel-content">
-          <span className="status-badge thinking">Thinking...</span>
+          <span className="status-badge waiting">Waiting</span>
         </div>
       </div>
     )

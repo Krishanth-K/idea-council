@@ -6,11 +6,11 @@ import ActiveCycle from './components/ActiveCycle'
 import VerdictSidebar from './components/VerdictSidebar'
 
 function App() {
-  const { connect, disconnect, connected, fetchState } = useStore()
+  const { connect, disconnect } = useStore()
 
   useEffect(() => {
+    useStore.setState({ intentionalDisconnect: false })
     connect()
-    fetchState()
 
     return () => disconnect()
   }, [])

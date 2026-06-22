@@ -3,13 +3,17 @@
 import asyncio
 import hashlib
 import json
+import os
 import uuid
 from datetime import datetime
 
+import httpx
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.responses import JSONResponse
 
+from council.core import DEFAULT_MODEL, OLLAMA_HOST
+from council.orchestrator import run_ideator, run_judge, run_round1, run_round2
 from council.scrape import dict_to_signal
 from council.scrape.arxiv import scrape_arxiv
 from council.scrape.devto import scrape_devto
@@ -91,6 +95,24 @@ SOURCE_SCRAPERS = [
 ]
 
 
+async def check_llm_connection() -> dict:
+    """Check whether the configured Ollama endpoint is reachable."""
+    headers = {}
+    api_key = os.getenv("OLLAMA_API_KEY", "")
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        response = await client.get(f"{OLLAMA_HOST.rstrip('/')}/api/tags", headers=headers)
+        response.raise_for_status()
+
+    return {
+        "provider": "ollama",
+        "host": OLLAMA_HOST,
+        "model": DEFAULT_MODEL,
+    }
+
+
 def verdict_to_dict(verdict) -> dict:
     """Serialize a verdict with enough data for the dashboard and transcripts."""
     return {
@@ -102,6 +124,31 @@ def verdict_to_dict(verdict) -> dict:
         "summary": verdict.summary,
         "debate_transcript": verdict.debate_transcript,
     }
+
+
+async def _emit_cycle_error(
+    run_id: str,
+    cycle_id: str,
+    signal_dict: dict,
+    stage: str,
+    message: str,
+):
+    """Record a cycle failure and notify connected clients."""
+    error = {
+        "error_id": str(uuid.uuid4()),
+        "stage": stage,
+        "message": message,
+        "created_at": datetime.now().isoformat(),
+    }
+    state.errors.append(error)
+    signal_dict["status"] = "error"
+    await emit_event(
+        "cycle_failed",
+        run_id,
+        {"stage": stage, "error": message},
+        cycle_id=cycle_id,
+        signal_id=signal_dict["signal_id"],
+    )
 
 
 async def emit_event(
@@ -172,6 +219,22 @@ async def start_run(request: dict):
 
 async def execute_run(run_id: str, max_signals: int):
     """Run scraping and council processing while streaming dashboard events."""
+    try:
+        await _execute_run(run_id, max_signals)
+    except Exception as exc:
+        error = {
+            "error_id": str(uuid.uuid4()),
+            "stage": "run",
+            "message": str(exc),
+            "created_at": datetime.now().isoformat(),
+        }
+        state.errors.append(error)
+        state.status = "failed"
+        state.completed_at = datetime.now().isoformat()
+        await emit_event("run_failed", run_id, {"error": str(exc)})
+
+
+async def _execute_run(run_id: str, max_signals: int):
     state.run_id = run_id
     state.status = "scraping"
     state.started_at = datetime.now().isoformat()
@@ -283,8 +346,88 @@ async def execute_run(run_id: str, max_signals: int):
         )
 
         # Run Ideator
-        from council.main import run_ideator
-        idea = run_ideator(signal)
+        state.active_cycle["ideator"] = {
+            "status": "connecting",
+            "provider": "ollama",
+            "host": OLLAMA_HOST,
+            "model": DEFAULT_MODEL,
+            "started_at": datetime.now().isoformat(),
+        }
+        await emit_event(
+            "ideator_started",
+            run_id,
+            {
+                "status": "connecting",
+                "provider": "ollama",
+                "host": OLLAMA_HOST,
+                "model": DEFAULT_MODEL,
+            },
+            cycle_id=cycle_id,
+            signal_id=signal_dict["signal_id"]
+        )
+
+        try:
+            llm = await check_llm_connection()
+        except Exception as exc:
+            error = {
+                "error_id": str(uuid.uuid4()),
+                "stage": "ideator",
+                "message": f"LLM connection failed: {exc}",
+                "created_at": datetime.now().isoformat(),
+            }
+            state.errors.append(error)
+            state.active_cycle["ideator"] = {
+                "status": "failed",
+                "error": error["message"],
+                "completed_at": datetime.now().isoformat(),
+            }
+            signal_dict["status"] = "error"
+            await emit_event(
+                "ideator_failed",
+                run_id,
+                {"error": error["message"]},
+                cycle_id=cycle_id,
+                signal_id=signal_dict["signal_id"]
+            )
+            continue
+
+        state.active_cycle["ideator"] = {
+            "status": "thinking",
+            **llm,
+            "started_at": datetime.now().isoformat(),
+        }
+        await emit_event(
+            "ideator_thinking",
+            run_id,
+            llm,
+            cycle_id=cycle_id,
+            signal_id=signal_dict["signal_id"]
+        )
+
+        try:
+            idea = await asyncio.to_thread(run_ideator, signal)
+        except Exception as exc:
+            error = {
+                "error_id": str(uuid.uuid4()),
+                "stage": "ideator",
+                "message": f"Ideator failed: {exc}",
+                "created_at": datetime.now().isoformat(),
+            }
+            state.errors.append(error)
+            state.active_cycle["ideator"] = {
+                "status": "failed",
+                "error": error["message"],
+                "completed_at": datetime.now().isoformat(),
+            }
+            signal_dict["status"] = "error"
+            await emit_event(
+                "ideator_failed",
+                run_id,
+                {"error": error["message"]},
+                cycle_id=cycle_id,
+                signal_id=signal_dict["signal_id"]
+            )
+            continue
 
         if idea.skip:
             state.active_cycle["ideator"] = {
@@ -329,8 +472,13 @@ async def execute_run(run_id: str, max_signals: int):
         }
         await emit_event("round_started", run_id, {"round": 1}, cycle_id=cycle_id)
 
-        from council.main import run_round1
-        round1_results = run_round1(idea)
+        try:
+            round1_results = await asyncio.to_thread(run_round1, idea)
+        except Exception as exc:
+            await _emit_cycle_error(
+                run_id, cycle_id, signal_dict, "round1", f"Round 1 failed: {exc}"
+            )
+            continue
 
         for dim, result in round1_results.items():
             state.active_cycle["round1"]["lawyers"][dim] = {
@@ -361,8 +509,13 @@ async def execute_run(run_id: str, max_signals: int):
         }
         await emit_event("round_started", run_id, {"round": 2}, cycle_id=cycle_id)
 
-        from council.main import run_round2
-        round2_results = run_round2(idea, round1_results)
+        try:
+            round2_results = await asyncio.to_thread(run_round2, idea, round1_results)
+        except Exception as exc:
+            await _emit_cycle_error(
+                run_id, cycle_id, signal_dict, "round2", f"Round 2 failed: {exc}"
+            )
+            continue
 
         for dim, result in round2_results.items():
             state.active_cycle["round2"]["lawyers"][dim] = {
@@ -386,8 +539,14 @@ async def execute_run(run_id: str, max_signals: int):
             )
 
         # Run Judge
-        from council.main import run_judge
-        verdict = run_judge(idea, round1_results, round2_results)
+        try:
+            verdict = await asyncio.to_thread(run_judge, idea, round1_results, round2_results)
+        except Exception as exc:
+            await _emit_cycle_error(
+                run_id, cycle_id, signal_dict, "judge", f"Judge failed: {exc}"
+            )
+            continue
+
         verdict_dict = verdict_to_dict(verdict)
         state.active_cycle["judge"] = {
             "status": "complete",
