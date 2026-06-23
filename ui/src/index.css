@@ -46,6 +46,49 @@ body {
   font-weight: 500;
 }
 
+.section-controls {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+}
+
+.section-control {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+}
+
+.section-label {
+  font-size: 11px;
+  color: #666;
+  text-transform: uppercase;
+}
+
+.btn-small {
+  padding: 4px 10px;
+  font-size: 12px;
+}
+
+.btn-danger {
+  background: #d32f2f;
+  color: white;
+}
+
+.btn-danger:hover {
+  background: #c62828;
+}
+
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.run-actions {
+  display: flex;
+  gap: 8px;
+}
+
 /* Dashboard Layout */
 .dashboard {
   display: flex;

@@ -217,6 +217,87 @@ async def start_run(request: dict):
     return {"run_id": run_id, "status": "started"}
 
 
+@app.post("/api/run/stop")
+async def stop_run():
+    """Stop the current run."""
+    if state.status == "idle":
+        return {"status": "idle", "message": "no run in progress"}
+
+    state.status = "stopping"
+    return {"status": "stopping", "message": "stopping run..."}
+
+
+@app.post("/api/run/start-scraping")
+async def start_scraping(request: dict):
+    """Start scraping phase only."""
+    if state.status in {"scraping", "processing"}:
+        return JSONResponse(
+            {"run_id": state.run_id, "status": state.status, "error": "run already in progress"},
+            status_code=409,
+        )
+
+    max_signals = request.get("max_signals", 10)
+    run_id = f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    asyncio.create_task(execute_scraping(run_id, max_signals))
+    return {"run_id": run_id, "status": "started", "section": "scraping"}
+
+
+@app.post("/api/run/start-ideator")
+async def start_ideator(request: dict):
+    """Start ideator phase only (requires signals to exist)."""
+    if state.status in {"scraping", "processing"}:
+        return JSONResponse(
+            {"run_id": state.run_id, "status": state.status, "error": "run already in progress"},
+            status_code=409,
+        )
+
+    if not state.signals:
+        return JSONResponse(
+            {"error": "no signals available - run scraping first"},
+            status_code=400,
+        )
+
+    run_id = state.run_id or f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    asyncio.create_task(execute_ideator_phase(run_id))
+    return {"run_id": run_id, "status": "started", "section": "ideator"}
+
+
+@app.post("/api/run/start-round1")
+async def start_round1(request: dict):
+    """Start round 1 phase only (requires ideas to exist)."""
+    if state.status in {"scraping", "processing"}:
+        return JSONResponse(
+            {"run_id": state.run_id, "status": state.status, "error": "run already in progress"},
+            status_code=409,
+        )
+
+    # Check if we have at least one signal with a completed idea
+    signals_with_ideas = [s for s in state.signals if s.get("status") == "processing" and s.get("idea")]
+    if not signals_with_ideas:
+        return JSONResponse(
+            {"error": "no ideas available - run ideator phase first"},
+            status_code=400,
+        )
+
+    run_id = state.run_id or f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    asyncio.create_task(execute_round1_phase(run_id))
+    return {"run_id": run_id, "status": "started", "section": "round1"}
+
+
+@app.post("/api/run/start-round2")
+async def start_round2(request: dict):
+    """Start round 2 phase only (requires round 1 to complete)."""
+    if state.status in {"scraping", "processing"}:
+        return JSONResponse(
+            {"run_id": state.run_id, "status": state.status, "error": "run already in progress"},
+            status_code=409,
+        )
+
+    run_id = state.run_id or f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    asyncio.create_task(execute_round2_phase(run_id))
+    return {"run_id": run_id, "status": "started", "section": "round2"}
+
+
 async def execute_run(run_id: str, max_signals: int):
     """Run scraping and council processing while streaming dashboard events."""
     try:
@@ -600,6 +681,387 @@ async def _execute_run(run_id: str, max_signals: int):
     state.status = "complete"
     state.completed_at = datetime.now().isoformat()
     await emit_event("run_completed", run_id, {})
+
+
+async def execute_scraping(run_id: str, max_signals: int):
+    """Execute scraping phase only."""
+    try:
+        await _execute_scraping(run_id, max_signals)
+    except Exception as exc:
+        if state.status != "stopping":
+            error = {
+                "error_id": str(uuid.uuid4()),
+                "stage": "scraping",
+                "message": str(exc),
+                "created_at": datetime.now().isoformat(),
+            }
+            state.errors.append(error)
+            state.status = "failed"
+            await emit_event("run_failed", run_id, {"error": str(exc)})
+
+
+async def _execute_scraping(run_id: str, max_signals: int):
+    """Scrape sources and queue signals."""
+    state.run_id = run_id
+    state.status = "scraping"
+    state.started_at = datetime.now().isoformat()
+    state.completed_at = None
+    state.sources = {}
+    state.signals = []
+    state.errors = []
+
+    await emit_event("run_started", run_id, {"max_signals": max_signals, "section": "scraping"})
+
+    init_db()
+
+    for source, scraper_fn in SOURCE_SCRAPERS:
+        if state.status == "stopping":
+            await emit_event("run_stopped", run_id, {"section": "scraping"})
+            state.status = "idle"
+            return
+
+        state.sources[source] = {
+            "source": source,
+            "status": "scraping",
+            "raw_count": 0,
+            "fresh_count": 0,
+            "duplicate_count": 0,
+            "started_at": datetime.now().isoformat(),
+        }
+        await emit_event("source_scrape_started", run_id, {"source": source})
+
+        raw_signals = await asyncio.to_thread(scraper_fn, max_signals)
+        source_signals = []
+        duplicate_count = 0
+
+        for raw_signal in raw_signals:
+            if state.status == "stopping":
+                await emit_event("run_stopped", run_id, {"section": "scraping"})
+                state.status = "idle"
+                return
+
+            sig = dict_to_signal(raw_signal)
+            if not sig.url:
+                continue
+
+            url_hash = hashlib.sha256(sig.url.encode()).hexdigest()
+            if is_signal_seen(url_hash):
+                duplicate_count += 1
+                continue
+
+            mark_signal_seen(url_hash, sig.url, sig.source, sig.scraped_at)
+            source_signals.append(sig)
+
+            signal_dict = {
+                "signal_id": str(uuid.uuid4()),
+                "source": sig.source,
+                "title": sig.title,
+                "url": sig.url,
+                "blurb": sig.blurb,
+                "scraped_at": sig.scraped_at,
+                "status": "queued",
+                "queue_index": len(state.signals),
+            }
+            state.signals.append(signal_dict)
+            await emit_event("signal_queued", run_id, signal_dict, signal_id=signal_dict["signal_id"])
+
+        state.sources[source] = {
+            "source": source,
+            "status": "complete",
+            "raw_count": len(raw_signals),
+            "fresh_count": len(source_signals),
+            "duplicate_count": duplicate_count,
+            "completed_at": datetime.now().isoformat(),
+        }
+        await emit_event(
+            "source_scrape_completed",
+            run_id,
+            {
+                "source": source,
+                "raw_count": len(raw_signals),
+                "fresh_count": len(source_signals),
+                "duplicate_count": duplicate_count,
+            }
+        )
+
+    state.status = "idle"
+    state.completed_at = datetime.now().isoformat()
+    await emit_event("section_completed", run_id, {"section": "scraping"})
+
+
+async def execute_ideator_phase(run_id: str):
+    """Execute ideator phase only."""
+    try:
+        await _execute_ideator(run_id)
+    except Exception as exc:
+        if state.status != "stopping":
+            error = {
+                "error_id": str(uuid.uuid4()),
+                "stage": "ideator",
+                "message": str(exc),
+                "created_at": datetime.now().isoformat(),
+            }
+            state.errors.append(error)
+            state.status = "failed"
+            await emit_event("run_failed", run_id, {"error": str(exc)})
+
+
+async def _execute_ideator(run_id: str):
+    """Run ideator for each signal that doesn't have an idea yet."""
+    state.status = "processing"
+    state.run_id = run_id
+
+    await emit_event("section_started", run_id, {"section": "ideator"})
+
+    # Find signals that need ideator processing (queued or need retry)
+    pending_signals = [s for s in state.signals if s.get("status") in {"queued", "processing"}]
+
+    for i, signal_dict in enumerate(pending_signals):
+        if state.status == "stopping":
+            await emit_event("run_stopped", run_id, {"section": "ideator"})
+            state.status = "idle"
+            return
+
+        # Skip if already has an idea
+        if signal_dict.get("idea"):
+            continue
+
+        cycle_id = str(uuid.uuid4())
+        signal_dict["status"] = "processing"
+        state.active_cycle = {
+            "cycle_id": cycle_id,
+            "signal_id": signal_dict["signal_id"],
+            "signal": signal_dict,
+            "ideator": {"status": "waiting"},
+            "round1": None,
+            "round2": None,
+            "judge": None,
+        }
+
+        await emit_event(
+            "signal_processing_started",
+            run_id,
+            {"signal_index": i},
+            cycle_id=cycle_id,
+            signal_id=signal_dict["signal_id"]
+        )
+
+        signal = Signal(
+            source=signal_dict["source"],
+            title=signal_dict["title"],
+            url=signal_dict["url"],
+            blurb=signal_dict["blurb"],
+            scraped_at=signal_dict["scraped_at"],
+        )
+
+        # Run Ideator
+        state.active_cycle["ideator"] = {
+            "status": "connecting",
+            "provider": "ollama",
+            "host": OLLAMA_HOST,
+            "model": DEFAULT_MODEL,
+            "started_at": datetime.now().isoformat(),
+        }
+        await emit_event(
+            "ideator_started",
+            run_id,
+            {"status": "connecting", "provider": "ollama", "host": OLLAMA_HOST, "model": DEFAULT_MODEL},
+            cycle_id=cycle_id,
+            signal_id=signal_dict["signal_id"]
+        )
+
+        try:
+            llm = await check_llm_connection()
+        except Exception as exc:
+            error = {
+                "error_id": str(uuid.uuid4()),
+                "stage": "ideator",
+                "message": f"LLM connection failed: {exc}",
+                "created_at": datetime.now().isoformat(),
+            }
+            state.errors.append(error)
+            state.active_cycle["ideator"] = {"status": "failed", "error": error["message"], "completed_at": datetime.now().isoformat()}
+            signal_dict["status"] = "error"
+            await emit_event("ideator_failed", run_id, {"error": error["message"]}, cycle_id=cycle_id, signal_id=signal_dict["signal_id"])
+            continue
+
+        state.active_cycle["ideator"] = {"status": "thinking", **llm, "started_at": datetime.now().isoformat()}
+        await emit_event("ideator_thinking", run_id, llm, cycle_id=cycle_id, signal_id=signal_dict["signal_id"])
+
+        try:
+            idea = await asyncio.to_thread(run_ideator, signal)
+        except Exception as exc:
+            error = {
+                "error_id": str(uuid.uuid4()),
+                "stage": "ideator",
+                "message": f"Ideator failed: {exc}",
+                "created_at": datetime.now().isoformat(),
+            }
+            state.errors.append(error)
+            state.active_cycle["ideator"] = {"status": "failed", "error": error["message"], "completed_at": datetime.now().isoformat()}
+            signal_dict["status"] = "error"
+            await emit_event("ideator_failed", run_id, {"error": error["message"]}, cycle_id=cycle_id, signal_id=signal_dict["signal_id"])
+            continue
+
+        if idea.skip:
+            state.active_cycle["ideator"] = {"status": "skipped", "skip_reason": idea.skip_reason, "completed_at": datetime.now().isoformat()}
+            signal_dict["status"] = "skipped"
+            state.skipped_signals.append({"cycle_id": cycle_id, "signal_id": signal_dict["signal_id"], "signal": signal_dict, "reason": idea.skip_reason})
+            await emit_event("ideator_skipped", run_id, {"reason": idea.skip_reason}, cycle_id=cycle_id, signal_id=signal_dict["signal_id"])
+            continue
+
+        state.active_cycle["ideator"] = {"status": "complete", "idea": idea.to_dict(), "completed_at": datetime.now().isoformat()}
+        signal_dict["idea"] = idea.to_dict()
+        await emit_event("ideator_completed", run_id, {"idea": idea.to_dict()}, cycle_id=cycle_id, signal_id=signal_dict["signal_id"])
+
+    state.status = "idle"
+    await emit_event("section_completed", run_id, {"section": "ideator"})
+
+
+async def execute_round1_phase(run_id: str):
+    """Execute round 1 phase only."""
+    try:
+        await _execute_round1(run_id)
+    except Exception as exc:
+        if state.status != "stopping":
+            error = {
+                "error_id": str(uuid.uuid4()),
+                "stage": "round1",
+                "message": str(exc),
+                "created_at": datetime.now().isoformat(),
+            }
+            state.errors.append(error)
+            state.status = "failed"
+            await emit_event("run_failed", run_id, {"error": str(exc)})
+
+
+async def _execute_round1(run_id: str):
+    """Run round 1 for signals that have ideas but no round1."""
+    state.status = "processing"
+    state.run_id = run_id
+
+    await emit_event("section_started", run_id, {"section": "round1"})
+
+    # Find signals with ideas but no round1
+    signals_with_ideas = [s for s in state.signals if s.get("idea") and not s.get("round1")]
+
+    for i, signal_dict in enumerate(signals_with_ideas):
+        if state.status == "stopping":
+            await emit_event("run_stopped", run_id, {"section": "round1"})
+            state.status = "idle"
+            return
+
+        cycle_id = str(uuid.uuid4())
+        signal_dict["status"] = "processing"
+        idea_dict = signal_dict["idea"]
+
+        state.active_cycle = {
+            "cycle_id": cycle_id,
+            "signal_id": signal_dict["signal_id"],
+            "signal": signal_dict,
+            "ideator": {"status": "complete", "idea": idea_dict},
+            "round1": None,
+            "round2": None,
+            "judge": None,
+        }
+
+        await emit_event("signal_processing_started", run_id, {"signal_index": i}, cycle_id=cycle_id, signal_id=signal_dict["signal_id"])
+        await emit_event("ideator_completed", run_id, {"idea": idea_dict}, cycle_id=cycle_id, signal_id=signal_dict["signal_id"])
+
+        # Run Round 1
+        state.active_cycle["round1"] = {"status": "running", "lawyers": {}, "started_at": datetime.now().isoformat()}
+        await emit_event("round_started", run_id, {"round": 1}, cycle_id=cycle_id)
+
+        try:
+            from council.models import Idea
+            idea = Idea.from_dict(idea_dict)
+            round1_results = await asyncio.to_thread(run_round1, idea)
+        except Exception as exc:
+            await _emit_cycle_error(run_id, cycle_id, signal_dict, "round1", f"Round 1 failed: {exc}")
+            continue
+
+        signal_dict["round1"] = round1_results
+        for dim, result in round1_results.items():
+            state.active_cycle["round1"]["lawyers"][dim] = {"score": result["score"], "argument": result["argument"], "key_points": result["key_points"], "status": "complete"}
+            await emit_event("lawyer_completed", run_id, {"round": 1, "dimension": dim, "score": result["score"], "argument": result["argument"], "key_points": result["key_points"]}, cycle_id=cycle_id, signal_id=signal_dict["signal_id"])
+
+    state.status = "idle"
+    await emit_event("section_completed", run_id, {"section": "round1"})
+
+
+async def execute_round2_phase(run_id: str):
+    """Execute round 2 phase only."""
+    try:
+        await _execute_round2(run_id)
+    except Exception as exc:
+        if state.status != "stopping":
+            error = {
+                "error_id": str(uuid.uuid4()),
+                "stage": "round2",
+                "message": str(exc),
+                "created_at": datetime.now().isoformat(),
+            }
+            state.errors.append(error)
+            state.status = "failed"
+            await emit_event("run_failed", run_id, {"error": str(exc)})
+
+
+async def _execute_round2(run_id: str):
+    """Run round 2 for signals that have round1 but no round2."""
+    state.status = "processing"
+    state.run_id = run_id
+
+    await emit_event("section_started", run_id, {"section": "round2"})
+
+    # Find signals with round1 but no round2
+    signals_with_round1 = [s for s in state.signals if s.get("round1") and not s.get("round2")]
+
+    for i, signal_dict in enumerate(signals_with_round1):
+        if state.status == "stopping":
+            await emit_event("run_stopped", run_id, {"section": "round2"})
+            state.status = "idle"
+            return
+
+        cycle_id = str(uuid.uuid4())
+        signal_dict["status"] = "processing"
+        idea_dict = signal_dict["idea"]
+        round1_results = signal_dict["round1"]
+
+        state.active_cycle = {
+            "cycle_id": cycle_id,
+            "signal_id": signal_dict["signal_id"],
+            "signal": signal_dict,
+            "ideator": {"status": "complete", "idea": idea_dict},
+            "round1": {"status": "complete", "lawyers": round1_results},
+            "round2": None,
+            "judge": None,
+        }
+
+        await emit_event("signal_processing_started", run_id, {"signal_index": i}, cycle_id=cycle_id, signal_id=signal_dict["signal_id"])
+        await emit_event("ideator_completed", run_id, {"idea": idea_dict}, cycle_id=cycle_id, signal_id=signal_dict["signal_id"])
+        await emit_event("round_started", run_id, {"round": 1}, cycle_id=cycle_id)
+        for dim, result in round1_results.items():
+            await emit_event("lawyer_completed", run_id, {"round": 1, "dimension": dim, "score": result["score"], "argument": result["argument"], "key_points": result.get("key_points", [])}, cycle_id=cycle_id, signal_id=signal_dict["signal_id"])
+
+        # Run Round 2
+        state.active_cycle["round2"] = {"status": "running", "lawyers": {}, "started_at": datetime.now().isoformat()}
+        await emit_event("round_started", run_id, {"round": 2}, cycle_id=cycle_id)
+
+        try:
+            from council.models import Idea
+            idea = Idea.from_dict(idea_dict)
+            round2_results = await asyncio.to_thread(run_round2, idea, round1_results)
+        except Exception as exc:
+            await _emit_cycle_error(run_id, cycle_id, signal_dict, "round2", f"Round 2 failed: {exc}")
+            continue
+
+        signal_dict["round2"] = round2_results
+        for dim, result in round2_results.items():
+            state.active_cycle["round2"]["lawyers"][dim] = {"original_score": round1_results[dim]["score"], "updated_score": result["updated_score"], "rebuttal": result["rebuttal"], "status": "complete"}
+            await emit_event("lawyer_completed", run_id, {"round": 2, "dimension": dim, "original_score": round1_results[dim]["score"], "updated_score": result["updated_score"], "rebuttal": result["rebuttal"]}, cycle_id=cycle_id, signal_id=signal_dict["signal_id"])
+
+    state.status = "idle"
+    await emit_event("section_completed", run_id, {"section": "round2"})
 
 
 if __name__ == "__main__":

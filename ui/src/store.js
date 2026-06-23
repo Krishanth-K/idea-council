@@ -270,7 +270,12 @@ const useStore = create((set, get) => ({
               idea: event.payload.idea,
               completed_at: event.timestamp
             }
-          })
+          }),
+          signals: state.signals.map(s =>
+            s.signal_id === event.signal_id
+              ? { ...s, status: 'complete', idea: event.payload.idea }
+              : s
+          )
         }))
         break
 
@@ -342,6 +347,36 @@ const useStore = create((set, get) => ({
           const base = resolveActiveCycle(state, event)
           if (!base) return {}
           const currentRound = base[round] || { status: 'running', lawyers: {} }
+
+          // Build the lawyer data to store in signal
+          const lawyerData = round === 'round1'
+            ? {
+                score: event.payload.score,
+                argument: event.payload.argument,
+                key_points: event.payload.key_points || []
+              }
+            : {
+                original_score: event.payload.original_score,
+                updated_score: event.payload.updated_score,
+                rebuttal: event.payload.rebuttal
+              }
+
+          // Update signals list with round data
+          const updatedSignals = state.signals.map(s => {
+            if (s.signal_id !== event.signal_id) return s
+            const existingRound = s[round] || {}
+            return {
+              ...s,
+              [round]: {
+                ...existingRound,
+                lawyers: {
+                  ...existingRound.lawyers,
+                  [event.payload.dimension]: { ...lawyerData, status: 'complete' }
+                }
+              }
+            }
+          })
+
           return {
             activeCycle: {
               ...base,
@@ -350,22 +385,13 @@ const useStore = create((set, get) => ({
                 lawyers: {
                   ...currentRound.lawyers,
                   [event.payload.dimension]: {
-                    ...(round === 'round1'
-                      ? {
-                          score: event.payload.score,
-                          argument: event.payload.argument,
-                          key_points: event.payload.key_points || []
-                        }
-                      : {
-                          original_score: event.payload.original_score,
-                          updated_score: event.payload.updated_score,
-                          rebuttal: event.payload.rebuttal
-                        }),
+                    ...lawyerData,
                     status: 'complete'
                   }
                 }
               }
-            }
+            },
+            signals: updatedSignals
           }
         })
         break
@@ -463,6 +489,36 @@ const useStore = create((set, get) => ({
         })
         break
 
+      case 'section_started':
+        set({
+          run: {
+            ...state.run,
+            status: 'processing',
+            stage: event.payload.section
+          }
+        })
+        break
+
+      case 'section_completed':
+        set({
+          run: {
+            ...state.run,
+            status: 'idle',
+            stage: null
+          }
+        })
+        break
+
+      case 'run_stopped':
+        set({
+          run: {
+            ...state.run,
+            status: 'idle',
+            stage: null
+          }
+        })
+        break
+
       case 'run_failed':
         set({
           run: {
@@ -489,6 +545,44 @@ const useStore = create((set, get) => ({
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ max_signals: maxSignals })
+    })
+    return response.json()
+  },
+
+  stopRun: async () => {
+    const response = await fetch('/api/run/stop', { method: 'POST' })
+    return response.json()
+  },
+
+  startScraping: async (maxSignals = 10) => {
+    const response = await fetch('/api/run/start-scraping', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ max_signals: maxSignals })
+    })
+    return response.json()
+  },
+
+  startIdeator: async () => {
+    const response = await fetch('/api/run/start-ideator', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' }
+    })
+    return response.json()
+  },
+
+  startRound1: async () => {
+    const response = await fetch('/api/run/start-round1', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' }
+    })
+    return response.json()
+  },
+
+  startRound2: async () => {
+    const response = await fetch('/api/run/start-round2', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' }
     })
     return response.json()
   },
