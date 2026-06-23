@@ -1,18 +1,26 @@
-import useStore from '../store'
+import { useState, useEffect } from 'react'
+import useStore, { SIGNAL_STATUS } from '../store'
 
 function RunHeader() {
-  const { run, connected, startRun, stopRun, startScraping, startIdeator, startRound1, startRound2 } = useStore()
+  const {
+    run,
+    connected,
+    signals,
+    sources,
+    startRun,
+    stopRun,
+    startScraping,
+    startIdeator,
+    startDebate
+  } = useStore()
 
   const isRunning = run.status === 'scraping' || run.status === 'processing'
   const isIdle = run.status === 'idle'
 
-  const handleStart = async () => {
-    await startRun(10)
-  }
-
-  const handleStop = async () => {
-    await stopRun()
-  }
+  // Count signals by status for button gating
+  const newSignals = signals.filter(s => s.status === SIGNAL_STATUS.SCRAPED).length
+  const pendingDebateIdeas = signals.filter(s => s.status === SIGNAL_STATUS.IDEA_GENERATED).length
+  const hasScrapedSignals = Object.values(sources).some(s => s.status === 'complete')
 
   const handleStartScraping = async () => {
     await startScraping(10)
@@ -22,79 +30,107 @@ function RunHeader() {
     await startIdeator()
   }
 
-  const handleStartRound1 = async () => {
-    await startRound1()
+  const handleStartDebate = async () => {
+    await startDebate()
   }
 
-  const handleStartRound2 = async () => {
-    await startRound2()
+  const handleStart = async () => {
+    await startRun(10)
   }
 
-  const SectionButton = ({ section, label, onClick, disabled }) => (
-    <div className="section-control">
-      <span className="section-label">{label}</span>
-      <button
-        className="btn btn-small btn-primary"
-        onClick={onClick}
-        disabled={disabled || isRunning}
-      >
-        Start
-      </button>
-    </div>
-  )
+  const handleStop = async () => {
+    await stopRun()
+  }
+
+  // Calculate elapsed time
+  const [elapsed, setElapsed] = useState(0)
+
+  useEffect(() => {
+    if (run.started_at && run.status !== 'idle' && run.status !== 'complete') {
+      const interval = setInterval(() => {
+        const start = new Date(run.started_at).getTime()
+        const now = Date.now()
+        setElapsed(Math.floor((now - start) / 1000))
+      }, 1000)
+      return () => clearInterval(interval)
+    } else {
+      setElapsed(0)
+    }
+  }, [run.started_at, run.status])
+
+  const formatTime = (seconds) => {
+    const mins = Math.floor(seconds / 60)
+    const secs = seconds % 60
+    return `${mins}:${secs.toString().padStart(2, '0')}`
+  }
 
   return (
     <div className="run-header">
-      <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+      <div className="header-left">
         <h1>IdeaCouncil</h1>
         <span className={`status-badge ${connected ? 'complete' : 'error'}`}>
           {connected ? 'Connected' : 'Disconnected'}
         </span>
       </div>
 
-      <div className="section-controls">
-        <SectionButton
-          section="scraping"
-          label="Scraping"
-          onClick={handleStartScraping}
-          disabled={!isIdle}
-        />
-        <SectionButton
-          section="ideator"
-          label="Signals → Ideas"
-          onClick={handleStartIdeator}
-          disabled={!isIdle}
-        />
-        <SectionButton
-          section="round1"
-          label="Ideas → Round 1"
-          onClick={handleStartRound1}
-          disabled={!isIdle}
-        />
-        <SectionButton
-          section="round2"
-          label="Round 1 → Round 2"
-          onClick={handleStartRound2}
-          disabled={!isIdle}
-        />
+      <div className="header-controls">
+        <div className="control-buttons">
+          <button
+            className="btn btn-primary"
+            onClick={handleStartScraping}
+            disabled={isRunning || !isIdle}
+          >
+            Start Scrape
+          </button>
+          <button
+            className="btn btn-primary"
+            onClick={handleStartIdeator}
+            disabled={isRunning || newSignals === 0}
+            title={newSignals === 0 ? 'No new signals to ideate' : ''}
+          >
+            Run Ideator {newSignals > 0 && `(${newSignals})`}
+          </button>
+          <button
+            className="btn btn-primary"
+            onClick={handleStartDebate}
+            disabled={isRunning || pendingDebateIdeas === 0}
+            title={pendingDebateIdeas === 0 ? 'No ideas pending debate' : ''}
+          >
+            Start Debate {pendingDebateIdeas > 0 && `(${pendingDebateIdeas})`}
+          </button>
+        </div>
+
+        <div className="run-actions">
+          <button
+            className="btn btn-full-run"
+            onClick={handleStart}
+            disabled={isRunning}
+          >
+            Full Run
+          </button>
+          <button
+            className="btn btn-stop"
+            onClick={handleStop}
+            disabled={!isRunning}
+          >
+            Stop
+          </button>
+        </div>
       </div>
 
-      <div className="run-stats">
-        <span>Status: <span className="count">{run.status}</span></span>
-        {run.stage && <span>Stage: <span className="count">{run.stage}</span></span>}
-        <span>Signals: <span className="count">{run.signals_processed}/{run.total_signals}</span></span>
-        <span>Saved: <span className="count">{run.saved_count}</span></span>
-        <span>Rejected: <span className="count">{run.rejected_count}</span></span>
-        <span>Skipped: <span className="count">{run.skipped_count}</span></span>
-      </div>
-
-      <div className="run-actions">
-        <button className="btn btn-primary" onClick={handleStart} disabled={isRunning}>
-          Start Full Run
-        </button>
-        <button className="btn btn-danger" onClick={handleStop} disabled={!isRunning}>
-          Stop
-        </button>
+      <div className="header-status">
+        <div className="status-strip">
+          {run.run_id && <span className="run-id">Run: {run.run_id.slice(0, 8)}</span>}
+          <span className={`stage-badge ${run.status}`}>
+            {run.stage || run.status}
+          </span>
+          {elapsed > 0 && <span className="elapsed">{formatTime(elapsed)}</span>}
+        </div>
+        <div className="stats-strip">
+          <span>Signals: <span className="count">{run.signals_processed}/{run.total_signals}</span></span>
+          <span className="saved">Saved: <span className="count">{run.saved_count}</span></span>
+          <span className="rejected">Rejected: <span className="count">{run.rejected_count}</span></span>
+        </div>
       </div>
     </div>
   )

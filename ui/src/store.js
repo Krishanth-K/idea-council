@@ -1,5 +1,22 @@
 import { create } from 'zustand'
 
+// Signal status enum: scraped → ideating → idea_generated → debating → resolved
+const SIGNAL_STATUS = {
+  SCRAPED: 'scraped',           // Signal discovered, no idea yet
+  IDEATING: 'ideating',         // Ideator is running
+  IDEA_GENERATED: 'idea_generated', // Idea created
+  DEBATING: 'debating',         // Debate in progress
+  RESOLVED: 'resolved'          // Saved or rejected
+}
+
+// Idea status enum
+const IDEA_STATUS = {
+  PENDING_DEBATE: 'pending_debate',
+  DEBATING: 'debating',
+  SAVED: 'saved',
+  REJECTED: 'rejected'
+}
+
 function resolveActiveCycle(state, event) {
   if (state.activeCycle?.cycle_id === event.cycle_id) {
     return state.activeCycle
@@ -44,7 +61,8 @@ const useStore = create((set, get) => ({
     skipped_count: 0,
     error_count: 0,
     started_at: null,
-    completed_at: null
+    completed_at: null,
+    elapsed_seconds: 0
   },
 
   // Sources
@@ -53,8 +71,19 @@ const useStore = create((set, get) => ({
   // Signals
   signals: [],
 
+  // Queue tracking for batch operations
+  ideationQueue: [],
+  debateQueue: [],
+
   // Active cycle
   activeCycle: null,
+
+  // Archived ideas (loaded from API)
+  archive: {
+    saved: [],
+    rejected: [],
+    loading: false
+  },
 
   // Completed cycles (verdicts)
   savedIdeas: [],
@@ -62,12 +91,35 @@ const useStore = create((set, get) => ({
   skippedSignals: [],
   errors: [],
 
+  // Current tab
+  activeTab: 'live-run',
+
+  // Detail drawer
+  selectedSignal: null,
+  selectedIdea: null,
+  drawerOpen: false,
+
   // WebSocket connection
   ws: null,
   connected: false,
   reconnectTimer: null,
   reconnectDelay: 1000,
   intentionalDisconnect: false,
+
+  // Actions
+  setActiveTab: (tab) => set({ activeTab: tab }),
+
+  openDrawer: (type, data) => set({
+    drawerOpen: true,
+    selectedSignal: type === 'signal' ? data : null,
+    selectedIdea: type === 'idea' ? data : null
+  }),
+
+  closeDrawer: () => set({
+    drawerOpen: false,
+    selectedSignal: null,
+    selectedIdea: null
+  }),
 
   // Connect to WebSocket
   connect: () => {
@@ -134,18 +186,21 @@ const useStore = create((set, get) => ({
             saved_count: 0,
             rejected_count: 0,
             skipped_count: 0,
-            error_count: 0
+            error_count: 0,
+            elapsed_seconds: 0
           },
           signals: [],
           activeCycle: null,
           savedIdeas: [],
           rejectedIdeas: [],
           skippedSignals: [],
-          errors: []
+          errors: [],
+          ideationQueue: [],
+          debateQueue: []
         })
         break
 
-      case 'source_scrape_started':
+      case 'source_started':
         set({
           sources: {
             ...state.sources,
@@ -161,7 +216,7 @@ const useStore = create((set, get) => ({
         })
         break
 
-      case 'source_scrape_completed':
+      case 'source_completed':
         set({
           sources: {
             ...state.sources,
@@ -171,6 +226,20 @@ const useStore = create((set, get) => ({
               raw_count: event.payload.raw_count,
               fresh_count: event.payload.fresh_count,
               duplicate_count: event.payload.duplicate_count,
+              completed_at: event.timestamp
+            }
+          }
+        })
+        break
+
+      case 'source_error':
+        set({
+          sources: {
+            ...state.sources,
+            [event.payload.source]: {
+              ...state.sources[event.payload.source],
+              status: 'error',
+              error: event.payload.error,
               completed_at: event.timestamp
             }
           }
@@ -195,7 +264,7 @@ const useStore = create((set, get) => ({
             url: event.payload.url,
             blurb: event.payload.blurb,
             scraped_at: event.payload.scraped_at,
-            status: 'queued',
+            status: SIGNAL_STATUS.SCRAPED,
             queue_index: event.payload.queue_index
           }],
           run: {
@@ -209,7 +278,7 @@ const useStore = create((set, get) => ({
         set({
           signals: state.signals.map(s =>
             s.signal_id === event.signal_id
-              ? { ...s, status: 'processing' }
+              ? { ...s, status: SIGNAL_STATUS.IDEATING }
               : s
           ),
           run: {
@@ -229,6 +298,75 @@ const useStore = create((set, get) => ({
         })
         break
 
+      // New events for parallel ideation
+      case 'ideation_started':
+        set(state => ({
+          ...patchActiveCycle(state, event, {
+            ideator: {
+              status: 'connecting',
+              provider: event.payload.provider,
+              host: event.payload.host,
+              model: event.payload.model,
+              started_at: event.timestamp
+            }
+          }),
+          signals: state.signals.map(s =>
+            s.signal_id === event.signal_id
+              ? { ...s, status: SIGNAL_STATUS.IDEATING }
+              : s
+          ),
+          ideationQueue: state.ideationQueue.includes(event.signal_id)
+            ? state.ideationQueue
+            : [...state.ideationQueue, event.signal_id]
+        }))
+        break
+
+      case 'ideation_completed':
+        set(state => ({
+          ...patchActiveCycle(state, event, {
+            ideator: {
+              status: 'complete',
+              idea: event.payload.idea,
+              completed_at: event.timestamp
+            }
+          }),
+          signals: state.signals.map(s =>
+            s.signal_id === event.signal_id
+              ? { ...s, status: SIGNAL_STATUS.IDEA_GENERATED, idea: event.payload.idea }
+              : s
+          ),
+          ideationQueue: state.ideationQueue.filter(id => id !== event.signal_id)
+        }))
+        break
+
+      case 'ideation_error':
+        set(state => ({
+          ...patchActiveCycle(state, event, {
+            ideator: {
+              status: 'failed',
+              error: event.payload.error,
+              completed_at: event.timestamp
+            }
+          }),
+          signals: state.signals.map(s =>
+            s.signal_id === event.signal_id
+              ? { ...s, status: 'error' }
+              : s
+          ),
+          ideationQueue: state.ideationQueue.filter(id => id !== event.signal_id),
+          run: {
+            ...state.run,
+            error_count: state.run.error_count + 1
+          },
+          errors: [...state.errors, {
+            error_id: `${event.cycle_id}-ideator`,
+            stage: 'ideator',
+            message: event.payload.error
+          }]
+        }))
+        break
+
+      // Legacy event handlers (keep for backward compatibility)
       case 'ideator_started':
         set(state => ({
           ...patchActiveCycle(state, event, {
@@ -239,7 +377,12 @@ const useStore = create((set, get) => ({
               model: event.payload.model,
               started_at: event.timestamp
             }
-          })
+          }),
+          signals: state.signals.map(s =>
+            s.signal_id === event.signal_id
+              ? { ...s, status: SIGNAL_STATUS.IDEATING }
+              : s
+          )
         }))
         break
 
@@ -273,7 +416,7 @@ const useStore = create((set, get) => ({
           }),
           signals: state.signals.map(s =>
             s.signal_id === event.signal_id
-              ? { ...s, status: 'complete', idea: event.payload.idea }
+              ? { ...s, status: SIGNAL_STATUS.IDEA_GENERATED, idea: event.payload.idea }
               : s
           )
         }))
@@ -336,7 +479,12 @@ const useStore = create((set, get) => ({
               lawyers: {},
               started_at: event.timestamp
             }
-          })
+          }),
+          signals: state.signals.map(s =>
+            s.signal_id === event.signal_id
+              ? { ...s, status: SIGNAL_STATUS.DEBATING }
+              : s
+          )
         }))
         break
       }
@@ -348,7 +496,6 @@ const useStore = create((set, get) => ({
           if (!base) return {}
           const currentRound = base[round] || { status: 'running', lawyers: {} }
 
-          // Build the lawyer data to store in signal
           const lawyerData = round === 'round1'
             ? {
                 score: event.payload.score,
@@ -361,7 +508,6 @@ const useStore = create((set, get) => ({
                 rebuttal: event.payload.rebuttal
               }
 
-          // Update signals list with round data
           const updatedSignals = state.signals.map(s => {
             if (s.signal_id !== event.signal_id) return s
             const existingRound = s[round] || {}
@@ -438,7 +584,7 @@ const useStore = create((set, get) => ({
           }],
           signals: state.signals.map(s =>
             s.signal_id === event.signal_id
-              ? { ...s, status: 'saved' }
+              ? { ...s, status: SIGNAL_STATUS.RESOLVED }
               : s
           ),
           run: {
@@ -459,7 +605,7 @@ const useStore = create((set, get) => ({
           }],
           signals: state.signals.map(s =>
             s.signal_id === event.signal_id
-              ? { ...s, status: 'rejected' }
+              ? { ...s, status: SIGNAL_STATUS.RESOLVED }
               : s
           ),
           run: {
@@ -571,16 +717,9 @@ const useStore = create((set, get) => ({
     return response.json()
   },
 
-  startRound1: async () => {
+  startDebate: async () => {
+    // Start Round 1 - debate is batch triggered
     const response = await fetch('/api/run/start-round1', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' }
-    })
-    return response.json()
-  },
-
-  startRound2: async () => {
-    const response = await fetch('/api/run/start-round2', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' }
     })
@@ -600,7 +739,35 @@ const useStore = create((set, get) => ({
       skippedSignals: data.skippedSignals,
       errors: data.errors
     })
+  },
+
+  // Archive actions
+  fetchArchive: async () => {
+    set(state => ({ archive: { ...state.archive, loading: true } }))
+
+    try {
+      const response = await fetch('/api/archive')
+      const data = await response.json()
+
+      set({
+        archive: {
+          saved: data.saved || [],
+          rejected: data.rejected || [],
+          loading: false
+        }
+      })
+    } catch (error) {
+      console.error('Failed to fetch archive:', error)
+      set(state => ({ archive: { ...state.archive, loading: false } }))
+    }
+  },
+
+  fetchArchiveDetail: async (id) => {
+    const response = await fetch(`/api/archive/${id}`)
+    return response.json()
   }
 }))
 
+// Export constants for use in components
+export { SIGNAL_STATUS, IDEA_STATUS }
 export default useStore
