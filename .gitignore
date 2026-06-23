@@ -71,3 +71,5 @@ pyrightconfig.json
 *_response.md
 
 **/node_modules/*
+
+CHANGES_PLAN.md

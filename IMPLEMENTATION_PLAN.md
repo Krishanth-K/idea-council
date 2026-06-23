@@ -1,98 +1,175 @@
-### Phase 1: State Management & Database Foundation
+# IdeaCouncil Implementation Plan — Dashboard Phase 1
 
-Get the data structures and storage out of the way first. You want zero friction when passing data between the LLMs.
+This plan maps the Phase 1 changes from `CHANGES_PLAN.md` into actionable implementation steps. The focus is on parallelizing scrape and ideation, adding archive support, and building the real-time dashboard UI.
 
-1. **Define the Dataclasses:**
-* Create `Signal`, `Idea`, and `Verdict` using Python's `@dataclass`.
-* Keep types strict here so you don't have to guess what the scrapers are handing to the LLMs.
+---
 
+## Phase 1: Database & API Foundation
 
-2. **Initialize SQLite:**
-* Write a `db.py` module with an `init_db()` function.
-* Execute the `CREATE TABLE` statements for `ideas` and `seen_signals` using the standard `sqlite3` library.
-* Write two helper functions: `is_signal_seen(url_hash)` and `save_verdict(verdict, full_transcript)`.
+Get the storage layer and archive endpoints ready first.
 
+### 1.1 Database Updates
 
+- **Fix rejected ideas storage**: Currently only saved ideas go to DB. Update the rejected branch in `server.py` (~lines 671–677) to call `save_verdict(verdict, full_transcript, saved=0)` for rejected verdicts too.
 
-### Phase 2: The Scraper Layer (The HTTP Pipeline)
+### 1.2 Archive API Endpoints
 
-Since you already have basic scrapers, wrap them in `httpx` and add the hashing logic.
+- **`GET /api/archive`** — Returns both saved and rejected ideas, grouped. Payload: `id, title, one_liner, scores, weighted_score, summary, created_at` (exclude `transcript` for list view).
+- **`GET /api/archive/{id}`** — Detail fetch, includes full `transcript` and verdict reasoning.
 
-1. **Implement API Calls:**
-* Create a separate function for each source (`scrape_github()`, `scrape_hn()`, etc.) using `httpx.get()`.
-* Extract only the required fields defined in your spec.
+---
 
+## Phase 2: Parallel Scraper Layer
 
-2. **Deduplication Logic:**
-* In the main scraping orchestrator, run each URL through `hashlib.sha256(url.encode()).hexdigest()`.
-* Check the hash against the `seen_signals` table. If it exists, drop it. If not, append it to your `list[Signal]` and insert the hash into the DB.
+Transform the sequential scraper into a parallel pipeline.
 
+### 2.1 Backend Parallelization
 
-3. **The Signal Batcher:**
-* Concatenate the valid `Signal` objects into a single formatted text block (e.g., `Title: ... \n Blurb: ...`) to feed the Ideator.
+- Modify `council/scrape/__init__.py`: wrap each `scraper_fn()` call in `asyncio.to_thread()` and fire all 5 with `asyncio.gather(*tasks, return_exceptions=True)`.
+- No changes needed inside individual scraper files (`github.py`, `hn.py`, etc.) — they remain synchronous.
 
+### 2.2 New WebSocket Events
 
+Add these events extending the existing `emit_event` pattern:
 
-### Phase 3: The LLM Core & Prompts
+- `source_started` — fired immediately when scrape starts, for all 5 sources.
+- `source_completed` — fired per source when it finishes (independently, respecting network variance).
+- `source_error` — fired per source on error; doesn't block other sources.
 
-This is the engine. Keep the `ollama` wrapper dead simple, but make it robust against malformed JSON.
+---
 
-1. **The Base Call:**
-* Implement `call_llm(system_prompt, user_prompt)` exactly as specified.
+## Phase 3: Parallel Ideation
 
+Parallelize idea generation across signals.
 
-2. **The JSON Wrapper:**
-* Write a `call_llm_json()` wrapper that tries to `json.loads()` the response. If it fails (because Qwen decided to add markdown blocks), strip the ````json` tags and try once more. If it fails twice, throw a handled exception to skip the cycle.
+### 3.1 Backend Parallelization
 
+- In `council/orchestrator.py` (~line 235), wrap each per-signal ideator call in `asyncio.to_thread()`.
+- Add `asyncio.Semaphore(2)` to cap concurrent ideation calls (protect the shared GPU). Make configurable.
 
-3. **Prompt Dictionary:**
-* Store your system prompts in a separate `prompts.py` file. You need: `IDEATOR_PROMPT`, the 5 Round 1 `LAWYER_PROMPTS`, the 5 Round 2 `REBUTTAL_PROMPTS`, and the `JUDGE_PROMPT`.
+### 3.2 New WebSocket Events
 
+- `ideation_started` — per signal, fired when ideation begins.
+- `ideation_completed` — per signal, carries the generated idea payload.
+- `ideation_error` — per signal, on failure.
 
+---
 
-### Phase 4: The Courtroom Orchestrator (The Main Loop)
+## Phase 4: Debate WebSocket Events
 
-This is where the magic happens. Build a single execution function `run_council_cycle(signals)` that processes one idea end-to-end.
+Add events for the sequential debate flow (Round 1 → Round 2 → Judge).
 
-1. **Generate the Idea:**
-* Pass the batched signals to the Ideator. Extract the JSON into the `Idea` dataclass.
+### 4.1 New WebSocket Events
 
+- `debate_started` — with `idea_id`
+- `round1_lawyer_started` / `round1_lawyer_completed` — with `idea_id`, `dimension`
+- `round2_lawyer_started` / `round2_lawyer_completed` — with `idea_id`, `dimension`
+- `judge_started` / `judge_completed` — with `idea_id`, `verdict`
 
-2. **Round 1 (Opening Arguments):**
-* Iterate through a dictionary of your 5 lawyers.
-* Pass the `Idea` to each lawyer independently.
-* Store their JSON responses in a `round1_results` dictionary.
+Note: Backend stays sequential (no `asyncio.gather` for lawyers in this phase). Round 1 parallelization is deferred to Phase 2.
 
+---
 
-3. **Transcript Assembly:**
-* Format a `transcript_so_far` string containing the `Idea` and all 5 arguments from `round1_results`.
+## Phase 5: Zustand Store (`ui/src/store.js`)
 
+Build the frontend state management.
 
-4. **Round 2 (Cross Examination):**
-* Iterate through the lawyers again. Pass the `transcript_so_far` to each.
-* Store their updated scores and rebuttals in a `round2_results` dictionary.
+### 5.1 Signal Status Enum
 
+Add `status` field to each signal: `scraped` → `ideating` → `idea_generated` → `debating` → `resolved`
 
-5. **The Verdict:**
-* Format the final `full_transcript` (Idea + R1 + R2).
-* Pass this to the Judge.
-* Parse the Judge's JSON output into the `Verdict` dataclass.
+### 5.2 Queue Tracking
 
+- `ideationQueue: []` — tracks signals pending/in-flight ideation
+- `debateQueue: []` — tracks ideas pending/in-flight debate
+- `activeCycle` — stays singular (debate is sequential across ideas in this phase)
 
+### 5.3 Archive Data
 
-### Phase 5: Routing & CLI
+- `archive: { saved: [], rejected: [] }` — populated by `/api/archive` endpoints on tab open (pull, not WS-streamed)
 
-Wrap it all up so you can trigger it cleanly from the terminal.
+---
 
-1. **The Verdict Router:**
-* Check the `Verdict` object. If `weighted_score >= 6.5` AND `solo_feasibility >= 5`, call your `save_verdict()` DB function. Otherwise, print a rejection message and move on.
+## Phase 6: UI Components
 
+Build the dashboard layout and visualization components.
 
-2. **Typer Interface:**
-* Build a quick CLI using `typer`.
-* Command 1: `python main.py run --cycles 5` (executes the scraper -> orchestrator loop N times).
-* Command 2: `python main.py browse` (fetches saved ideas from SQLite and uses `rich` to print a clean table of the high-scoring projects).
+### 6.1 Page Layout
 
+- **"Live Run" tab** — active pipeline board
+- **"Archive" tab** — historical saved/rejected ideas
 
+### 6.2 Live Run Tab
 
-Build the DB, plug in the HTTP calls, write the orchestrator loop, and let Ollama argue with itself while you get back to writing C.
+**Top Control Bar:**
+- `[Start Scrape]` — disabled while scrape in-flight
+- `[Run Ideator]` — disabled if no signals are `New` or ideation in-flight
+- `[Start Debate]` — disabled if no ideas are `Pending Debate` or debate in-flight
+- Status strip: `run_id`, current stage, elapsed time
+
+**Three-Column Board:**
+- **Column A — Signals**: scraped signals with badges (`New` / `Idea Generated` / `Debating` / `Resolved`)
+- **Column B — Ideas**: ideas with badges (`Pending Debate` / `Debating` / `Saved` / `Rejected`)
+- **Column C — Active Debate**: courtroom visualization for current idea, plus "up next" queue
+
+**Detail Drawer:**
+- Signal card: raw scraped payload, source, link, timestamp
+- Idea card: generated text, parent signal, (after debate) transcript + scores
+
+### 6.3 Scrape Animation
+
+- 5 source cards (GitHub / Hacker News / arXiv / DEV.to / Lobste.rs)
+- On click: all 5 transition to "scraping" state (pulse/shimmer + spinner)
+- On `source_completed`: flip to "done" with count badge, signals slide into Column A with source-colored dots
+
+### 6.4 Ideation Animation
+
+- In Column A, `New` cards show thinking/spinner
+- On `ideation_completed`: badge flips to `Idea Generated`, card slides to Column B
+
+### 6.5 Debate Visualization
+
+- 5 lawyer cards (Novelty / Feasibility / Technical Depth / Resume Value / Real Use Case)
+- Sequential highlight: active lawyer highlights → reveals score + argument → moves to next
+- Round 2: adds "Rebuttal" section below each argument
+- Judge: "bench" card appears, shows score breakdown, weighted score, save/reject decision with verdict animation
+
+### 6.6 Archive Tab
+
+- Filter toggle: Saved / Rejected
+- Card grid or table: title, one-liner, weighted score, per-dimension visualization, created_at
+- Click opens detail drawer with full transcript + verdict reasoning
+
+---
+
+## Phase 7: Integration & Testing
+
+Connect the pieces and verify the flow.
+
+### 7.1 WS Connection
+
+- Ensure frontend connects to WebSocket on load
+- Route incoming events to correct store actions
+
+### 7.2 Button Gating
+
+- Verify buttons disable correctly based on pipeline state
+- Test: Start Scrape → Run Ideator → Start Debate end-to-end
+
+### 7.3 Archive Verification
+
+- Run a cycle that saves an idea (weighted_score >= 6.5 AND solo_feasibility >= 5)
+- Run a cycle that rejects an idea
+- Verify both appear in `/api/archive` and display correctly in Archive tab
+
+---
+
+## Notes
+
+- **Round 1 parallelization** is deferred to a future Phase 2 — the event schema already supports it.
+- **Debate stays sequential** across ideas (not concurrent) to avoid 11+ simultaneous LLM calls on the single shared GPU.
+- **Batch triggers**: "Run Ideator" and "Start Debate" act on all eligible items, not per-card actions.
+
+---
+
+Build the storage layer, wire up parallel scrapers and ideation, add archive endpoints, then construct the real-time dashboard UI.
