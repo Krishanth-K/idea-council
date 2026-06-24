@@ -2,10 +2,11 @@
 
 from typing import Optional
 
-from council.core import call_llm_json, call_llm
-from council.models import Idea, Verdict, CycleState, Signal
-from council.prompts import IDEATOR_PROMPT, LAWYER_PROMPTS_R1, LAWYER_PROMPTS_R2, JUDGE_PROMPT
+from council.core import call_llm, call_llm_json
 from council.db import save_verdict
+from council.models import CycleState, Idea, Signal, Verdict
+from council.prompts import (IDEATOR_PROMPT, JUDGE_PROMPT, LAWYER_PROMPTS_R1,
+                             LAWYER_PROMPTS_R2)
 
 
 def run_ideator(signal: Signal) -> Idea:
@@ -19,22 +20,22 @@ def run_ideator(signal: Signal) -> Idea:
         Idea object (or Idea with skip=True if signal is insufficient)
     """
     # Format the single signal
-    signal_text = f"""Source: {signal.source}
-Title: {signal.title}
-Blurb: {signal.blurb}
-URL: {signal.url}"""
+    signal_text = f"""
+    Source: {signal.source}
+    Title: {signal.title}
+    Blurb: {signal.blurb}
+    URL: {signal.url}"""
 
     user_prompt = f"""Here is a signal from a source:
-
-{signal_text}
-
-Based on this signal, propose a project idea that a solo developer can build.
-The idea should be directly inspired by this signal — use the title, blurb, or context as a starting point."""
+    {signal_text}
+    Based on this signal, propose a project idea that a solo developer can build.
+    The idea should be directly inspired by this signal — use the title, blurb, or context as a starting point."""
 
     # Call LLM and parse JSON
     try:
         result = call_llm_json(IDEATOR_PROMPT, user_prompt)
         idea = Idea.from_dict(result)
+
         # Track which signal inspired this idea
         if not idea.skip:
             idea.source_signals = [signal.title]

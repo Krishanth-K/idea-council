@@ -292,3 +292,4 @@ Too hard for an LLM to score reliably without a detailed personal profile in the
 
 # Known issues / debt
 —
+only the blurb is used by the ideator to generate a potential idea from the signal - needs to use the entire summary for more accurate ideas  
