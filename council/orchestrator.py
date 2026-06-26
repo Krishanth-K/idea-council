@@ -3,28 +3,17 @@
 from typing import Optional
 
 from council.core import call_llm, call_llm_json
-from council.db import save_verdict
-from council.models import CycleState, Idea, Signal, Verdict
+from council.db import (
+    save_verdict, save_signal, save_idea, save_lawyer_statement
+)
+from council.models import CycleState, Idea, IdeatorSkipReason, Signal, Verdict
 from council.prompts import (IDEATOR_PROMPT, JUDGE_PROMPT, LAWYER_PROMPTS_R1,
                              LAWYER_PROMPTS_R2)
+from council.logger import logger, setup_logger
 
 
-def run_ideator(signal: Signal) -> Idea:
-    """
-    Run the Ideator agent to propose a project idea from a single signal.
-
-    Args:
-        signal: A single Signal object to feed the Ideator
-
-    Returns:
-        Idea object (or Idea with skip=True if signal is insufficient)
-    """
-    # Format the single signal
-    signal_text = f"""
-    Source: {signal.source}
-    Title: {signal.title}
-    Blurb: {signal.blurb}
-    URL: {signal.url}"""
+def _run_ideator_once(signal: Signal, include_summary: bool = False):
+    signal_text = _format_signal_for_ideator(signal, include_summary)
 
     user_prompt = f"""Here is a signal from a source:
     {signal_text}
@@ -34,15 +23,8 @@ def run_ideator(signal: Signal) -> Idea:
     # Call LLM and parse JSON
     try:
         result = call_llm_json(IDEATOR_PROMPT, user_prompt)
-        idea = Idea.from_dict(result)
-
-        # Track which signal inspired this idea
-        if not idea.skip:
-            idea.source_signals = [signal.title]
-        return idea
-    except ValueError as e:
-        # If JSON parsing fails, create a skip idea
-        print(f"Ideator error: {e}")
+        return Idea.from_dict(result)
+    except ValueError:
         return Idea(
             title="",
             one_liner="",
@@ -50,8 +32,51 @@ def run_ideator(signal: Signal) -> Idea:
             problem_it_solves="",
             core_technical_challenge="",
             skip=True,
-            skip_reason="Failed to parse Ideator response"
+            skip_reason="parse_failure",
         )
+
+
+def _format_signal_for_ideator(signal: Signal, include_summary: bool) -> str:
+  parts = [
+      f"Source: {signal.source}",
+      f"Title: {signal.title}",
+      f"Blurb: {signal.blurb}",
+  ]
+
+  if include_summary and signal.summary:
+      parts.append(f"Full Summary: {signal.summary}")
+
+  parts.append(f"URL: {signal.url}")
+  return "\n".join(parts)
+
+
+
+def run_ideator(signal: Signal) -> Idea:
+    """
+    Run the Ideator agent to propose a project idea from a single signal.
+
+    Args:
+        signal: A single Signal object to feed the Ideator
+    Returns:
+        Idea object (or Idea with skip=True if signal is insufficient)
+    """
+
+    idea = _run_ideator_once(signal)
+
+    # Track which signal inspired this idea
+    if not idea.skip:
+        idea.source_signals = [signal.title]
+        return idea
+
+    if idea.skip_reason != IdeatorSkipReason.INSUFFICIENT_CONTEXT.value:
+        return idea
+
+    if not signal.summary:
+        return idea
+
+    expanded_idea = _run_ideator_once(signal, include_summary=True)
+    expanded_idea.source_signals = [signal.title]
+    return expanded_idea
 
 
 def run_round1(idea: Idea) -> dict[str, dict]:
@@ -60,19 +85,20 @@ def run_round1(idea: Idea) -> dict[str, dict]:
 
     Args:
         idea: The Idea to evaluate
-
     Returns:
         Dictionary mapping dimension -> {score, argument, key_points}
     """
     results = {}
 
     # Format the idea for the user prompt
-    idea_text = f"""Title: {idea.title}
+    idea_text = f"""
+    Title: {idea.title}
     One-liner: {idea.one_liner}
     Target User: {idea.target_user}
     Problem: {idea.problem_it_solves}
     Technical Challenge: {idea.core_technical_challenge}
-    Estimated Scope: {idea.estimated_scope}"""
+    Estimated Scope: {idea.estimated_scope}
+    """
 
     for dimension, prompt in LAWYER_PROMPTS_R1.items():
         try:
@@ -82,11 +108,14 @@ def run_round1(idea: Idea) -> dict[str, dict]:
                 "argument": result.get("argument", ""),
                 "key_points": result.get("key_points", []),
             }
-            print(f"  {dimension}: score {result.get('score', '?')}/10")
+
+            logger.info(f"  {dimension}: score {result.get('score', '?')}/10")
+
         except ValueError as e:
-            print(f"  {dimension}: error parsing response")
+            logger.error(f"  {dimension}: error parsing response: {e}")
+
             results[dimension] = {
-                "score": 5,  # Default score on error
+                "score": -1,  # Default score on error
                 "argument": f"Error: {e}",
                 "key_points": [],
             }
@@ -128,9 +157,9 @@ def run_round2(idea: Idea, round1_results: dict[str, dict]) -> dict[str, dict]:
                 "updated_score": result.get("updated_score", round1_results[dimension]["score"]),
                 "rebuttal": result.get("rebuttal", ""),
             }
-            print(f"  {dimension} R2: score {result.get('updated_score', '?')}/10")
+            logger.info(f"  {dimension} R2: score {result.get('updated_score', '?')}/10")
         except ValueError as e:
-            print(f"  {dimension} R2: error parsing response")
+            logger.error(f"  {dimension} R2: error parsing response: {e}")
             results[dimension] = {
                 "updated_score": round1_results[dimension]["score"],
                 "rebuttal": f"Error: {e}",
@@ -203,7 +232,7 @@ def run_judge(idea: Idea, round1_results: dict, round2_results: dict) -> Verdict
         return verdict
 
     except ValueError as e:
-        print(f"Judge error: {e}")
+        logger.error(f"Judge error: {e}")
         # Return a default verdict on error
         return Verdict(
             idea_title=idea.title,
@@ -219,7 +248,7 @@ def run_judge(idea: Idea, round1_results: dict, round2_results: dict) -> Verdict
 def run_council_cycle(signals: list[Signal]) -> list[Optional[Verdict]]:
     """
     Run complete council cycles: one per signal.
-    For each signal: Ideate -> Round 1 -> Round 2 -> Judge -> Save.
+    For each signal: Save Signal -> Ideate -> Save Idea -> Round 1 -> Save R1 -> Round 2 -> Save R2 -> Judge -> Save Verdict.
 
     Args:
         signals: List of signals to process
@@ -227,63 +256,92 @@ def run_council_cycle(signals: list[Signal]) -> list[Optional[Verdict]]:
     Returns:
         List of Verdict objects (None for skipped ideas)
     """
-    print("\n" + "=" * 50)
-    print(f"COUNCIL CYCLE STARTING ({len(signals)} signals)")
-    print("=" * 50)
+    setup_logger()
+    logger.info("\n" + "=" * 50)
+    logger.info(f"COUNCIL CYCLE STARTING ({len(signals)} signals)")
+    logger.info("=" * 50)
 
     verdicts = []
 
     for i, signal in enumerate(signals):
-        print(f"\n--- Signal {i + 1}/{len(signals)} ---")
-        print(f"Source: {signal.source} | {signal.title[:50]}...")
+        logger.info(f"\n--- Signal {i + 1}/{len(signals)} ---")
+        logger.info(f"Source: {signal.source} | {signal.title[:50]}...")
+
+        # 1. Save Signal
+        signal_id = save_signal(signal)
 
         # Initialize state for this signal
         state = CycleState(signals=[signal])
 
         # Step 1: Ideator (one idea per signal)
-        print("\n[1/4] Running Ideator...")
+        logger.info("\n[1/4] Running Ideator...")
         state.idea = run_ideator(signal)
 
+        # 2. Save Idea (skipped or not)
+        idea_id = save_idea(signal_id, state.idea)
+
         if state.idea.skip:
-            print(f"  Skipped: {state.idea.skip_reason}")
+            logger.info(f"  Skipped: {state.idea.skip_reason}")
             verdicts.append(None)
             continue
 
-        print(f"  Proposed: {state.idea.title}")
+        logger.info(f"  Proposed: {state.idea.title}")
 
         # Step 2: Round 1
-        print("\n[2/4] Running Round 1 (Opening Arguments)...")
+        logger.info("\n[2/4] Running Round 1 (Opening Arguments)...")
         state.round1 = run_round1(state.idea)
 
+        # 3. Save Round 1 lawyer statements
+        for dimension, data in state.round1.items():
+            save_lawyer_statement(
+                idea_id=idea_id,
+                dimension=dimension,
+                round_num=1,
+                score=data.get("score", 0),
+                argument=data.get("argument", ""),
+                key_points=data.get("key_points")
+            )
+
         # Step 3: Round 2
-        print("\n[3/4] Running Round 2 (Cross Examination)...")
+        logger.info("\n[3/4] Running Round 2 (Cross Examination)...")
         state.round2 = run_round2(state.idea, state.round1)
 
+        # 4. Save Round 2 lawyer statements
+        for dimension, data in state.round2.items():
+            save_lawyer_statement(
+                idea_id=idea_id,
+                dimension=dimension,
+                round_num=2,
+                score=data.get("updated_score", 0),
+                argument=data.get("rebuttal", "")
+            )
+
         # Step 4: Judge
-        print("\n[4/4] Running Judge...")
+        logger.info("\n[4/4] Running Judge...")
         state.verdict = run_judge(state.idea, state.round1, state.round2)
 
         # Print verdict summary
-        print("\n" + "-" * 30)
-        print(f"  Idea: {state.verdict.idea_title}")
-        print(f"  Scores: {state.verdict.scores}")
-        print(f"  Weighted: {state.verdict.weighted_score}/10")
-        print(f"  Save: {state.verdict.save}")
+        logger.info("\n" + "-" * 30)
+        logger.info(f"  Idea: {state.verdict.idea_title}")
+        logger.info(f"  Scores: {state.verdict.scores}")
+        logger.info(f"  Weighted: {state.verdict.weighted_score}/10")
+        logger.info(f"  Save: {state.verdict.save}")
 
-        # Save if threshold met
+        # 5. Save Verdict (both saved and rejected)
         if state.verdict.save:
-            print("  ✓ Saving to database...")
-            save_verdict(state.verdict, state.verdict.debate_transcript)
+            logger.info("  ✓ Saving to database...")
+            save_verdict(state.verdict, state.verdict.debate_transcript, saved=1, idea_id=idea_id)
         else:
-            print("  ✗ Rejected")
+            logger.info("  ✗ Rejected (saving to database...)")
+            save_verdict(state.verdict, state.verdict.debate_transcript, saved=0, idea_id=idea_id)
 
         verdicts.append(state.verdict)
 
     # Summary
     saved = sum(1 for v in verdicts if v and v.save)
-    print("\n" + "=" * 50)
-    print(f"CYCLE COMPLETE: {saved}/{len(signals)} ideas saved")
-    print("=" * 50)
+    logger.info("\n" + "=" * 50)
+    logger.info(f"CYCLE COMPLETE: {saved}/{len(signals)} ideas saved")
+    logger.info("=" * 50)
 
     return verdicts
 

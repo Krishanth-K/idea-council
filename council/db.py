@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 from typing import Optional
 
-from council.models import Verdict
+from council.models import Verdict, Signal, Idea
 
 
 DB_PATH = Path(__file__).parent.parent / "ideacouncil.db"
@@ -23,7 +23,7 @@ def init_db() -> None:
     conn = get_connection()
     cursor = conn.cursor()
 
-    # Ideas table
+    # Ideas table (representing final verdicts)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS ideas (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -47,6 +47,58 @@ def init_db() -> None:
             scraped_at  TEXT
         )
     """)
+
+    # Signals table (stores full signal details)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS signals (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            title       TEXT,
+            source      TEXT,
+            url         TEXT,
+            blurb       TEXT,
+            summary     TEXT,
+            scraped_at  TEXT,
+            url_hash    TEXT UNIQUE
+        )
+    """)
+
+    # Pipeline Ideas table (stores generated ideas, skipped or not)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS pipeline_ideas (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            signal_id           INTEGER REFERENCES signals(id),
+            title               TEXT,
+            one_liner           TEXT,
+            target_user         TEXT,
+            problem_it_solves   TEXT,
+            core_technical_challenge TEXT,
+            estimated_scope     TEXT,
+            skip                INTEGER, -- 0 or 1
+            skip_reason         TEXT,
+            created_at          TEXT DEFAULT (datetime('now'))
+        )
+    """)
+
+    # Lawyer statements table (R1 and R2 statements)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS lawyer_statements (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            idea_id         INTEGER REFERENCES pipeline_ideas(id),
+            dimension       TEXT,
+            round           INTEGER, -- 1 or 2
+            score           INTEGER,
+            argument        TEXT,
+            key_points      TEXT, -- JSON list of strings (for round 1)
+            created_at      TEXT DEFAULT (datetime('now'))
+        )
+    """)
+
+    # Ensure ideas table has the new columns if needed (backward compatibility migration)
+    try:
+        cursor.execute("ALTER TABLE ideas ADD COLUMN idea_id INTEGER REFERENCES pipeline_ideas(id)")
+    except sqlite3.OperationalError:
+        # Column already exists
+        pass
 
     conn.commit()
     conn.close()
@@ -78,7 +130,88 @@ def mark_signal_seen(url_hash: str, url: str, source: str, scraped_at: str) -> N
     conn.close()
 
 
-def save_verdict(verdict: Verdict, full_transcript: str) -> int:
+def save_signal(signal: Signal) -> int:
+    """Save a signal and return its database ID."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    # Check if signal is already in signals table
+    cursor.execute("SELECT id FROM signals WHERE url_hash = ?", (signal.url_hash(),))
+    row = cursor.fetchone()
+    if row:
+        signal_id = row["id"]
+    else:
+        cursor.execute(
+            """
+            INSERT INTO signals (title, source, url, blurb, summary, scraped_at, url_hash)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                signal.title,
+                signal.source,
+                signal.url,
+                signal.blurb,
+                signal.summary,
+                signal.scraped_at,
+                signal.url_hash()
+            )
+        )
+        signal_id = cursor.lastrowid
+        
+    conn.commit()
+    conn.close()
+    return signal_id
+
+
+def save_idea(signal_id: int, idea: Idea) -> int:
+    """Save a pipeline idea and return its database ID."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO pipeline_ideas (
+            signal_id, title, one_liner, target_user, problem_it_solves,
+            core_technical_challenge, estimated_scope, skip, skip_reason
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            signal_id,
+            idea.title,
+            idea.one_liner,
+            idea.target_user,
+            idea.problem_it_solves,
+            idea.core_technical_challenge,
+            idea.estimated_scope,
+            1 if idea.skip else 0,
+            idea.skip_reason
+        )
+    )
+    idea_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return idea_id
+
+
+def save_lawyer_statement(idea_id: int, dimension: str, round_num: int, score: int, argument: str, key_points: list[str] = None) -> int:
+    """Save a lawyer statement (argument or rebuttal)."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    kp_json = json.dumps(key_points) if key_points else None
+    cursor.execute(
+        """
+        INSERT INTO lawyer_statements (
+            idea_id, dimension, round, score, argument, key_points
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (idea_id, dimension, round_num, score, argument, kp_json)
+    )
+    statement_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return statement_id
+
+
+def save_verdict(verdict: Verdict, full_transcript: str, saved: Optional[int] = None, idea_id: Optional[int] = None) -> int:
     """
     Save a verdict to the database.
     Returns the inserted row ID.
@@ -86,20 +219,23 @@ def save_verdict(verdict: Verdict, full_transcript: str) -> int:
     conn = get_connection()
     cursor = conn.cursor()
 
+    is_saved = saved if saved is not None else (1 if verdict.save else 0)
+
     cursor.execute(
         """
         INSERT INTO ideas (
-            title, one_liner, scores, weighted_score, saved, summary, transcript
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            title, one_liner, scores, weighted_score, saved, summary, transcript, idea_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             verdict.idea_title,
             verdict.one_liner,
             json.dumps(verdict.scores),
             verdict.weighted_score,
-            1 if verdict.save else 0,
+            is_saved,
             verdict.summary,
-            full_transcript
+            full_transcript,
+            idea_id
         )
     )
 

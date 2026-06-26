@@ -1,7 +1,6 @@
 """API server for IdeaCouncil UI - provides WebSocket events."""
 
 import asyncio
-import hashlib
 import json
 import os
 import uuid
@@ -14,14 +13,11 @@ from starlette.responses import JSONResponse
 
 from council.core import DEFAULT_MODEL, OLLAMA_HOST
 from council.orchestrator import run_ideator, run_judge, run_round1, run_round2
-from council.scrape import dict_to_signal
-from council.scrape.arxiv import scrape_arxiv
-from council.scrape.devto import scrape_devto
-from council.scrape.github import scrape_github
-from council.scrape.hn import scrape_hn
-from council.scrape.lobsters import scrape_lobsters
-from council.models import Signal
-from council.db import get_saved_ideas, init_db, is_signal_seen, mark_signal_seen
+from council.scrape import scrape_all, signal_to_dict
+from council.db import (
+    get_saved_ideas, init_db, save_signal, save_idea,
+    save_lawyer_statement, save_verdict
+)
 
 app = FastAPI()
 
@@ -86,15 +82,6 @@ class AppState:
 state = AppState()
 
 
-SOURCE_SCRAPERS = [
-    ("GitHub", lambda max_signals: scrape_github(max_signals)),
-    ("Hacker News", lambda max_signals: scrape_hn()),
-    ("arXiv", lambda max_signals: scrape_arxiv(max_results=max_signals)),
-    ("DEV.to", lambda max_signals: scrape_devto(max_signals)),
-    ("Lobste.rs", lambda max_signals: scrape_lobsters(max_signals)),
-]
-
-
 async def check_llm_connection() -> dict:
     """Check whether the configured Ollama endpoint is reachable."""
     headers = {}
@@ -110,19 +97,6 @@ async def check_llm_connection() -> dict:
         "provider": "ollama",
         "host": OLLAMA_HOST,
         "model": DEFAULT_MODEL,
-    }
-
-
-def verdict_to_dict(verdict) -> dict:
-    """Serialize a verdict with enough data for the dashboard and transcripts."""
-    return {
-        "idea_title": verdict.idea_title,
-        "one_liner": verdict.one_liner,
-        "scores": verdict.scores,
-        "weighted_score": verdict.weighted_score,
-        "save": verdict.save,
-        "summary": verdict.summary,
-        "debate_transcript": verdict.debate_transcript,
     }
 
 
@@ -333,8 +307,23 @@ async def _execute_run(run_id: str, max_signals: int):
 
     init_db()
 
-    # Scrape and stream each source independently so the dashboard updates live.
-    for source, scraper_fn in SOURCE_SCRAPERS:
+    # Scrape each source and emit events for dashboard updates
+    # Import scrapers here to avoid import-time issues
+    from council.scrape import (
+        scrape_github, scrape_hn, scrape_arxiv,
+        scrape_devto, scrape_lobsters, dict_to_signal
+    )
+    from council.db import is_signal_seen, mark_signal_seen
+
+    source_scrapers = [
+        ("GitHub", lambda: scrape_github(max_signals)),
+        ("Hacker News", lambda: scrape_hn()),
+        ("arXiv", lambda: scrape_arxiv(max_results=max_signals)),
+        ("DEV.to", lambda: scrape_devto(max_signals)),
+        ("Lobste.rs", lambda: scrape_lobsters(max_signals)),
+    ]
+
+    for source, scraper_fn in source_scrapers:
         state.sources[source] = {
             "source": source,
             "status": "scraping",
@@ -345,7 +334,7 @@ async def _execute_run(run_id: str, max_signals: int):
         }
         await emit_event("source_scrape_started", run_id, {"source": source})
 
-        raw_signals = await asyncio.to_thread(scraper_fn, max_signals)
+        raw_signals = await asyncio.to_thread(scraper_fn)
         source_signals = []
         duplicate_count = 0
 
@@ -354,24 +343,17 @@ async def _execute_run(run_id: str, max_signals: int):
             if not sig.url:
                 continue
 
-            url_hash = hashlib.sha256(sig.url.encode()).hexdigest()
+            url_hash = sig.url_hash()
             if is_signal_seen(url_hash):
                 duplicate_count += 1
                 continue
 
             mark_signal_seen(url_hash, sig.url, sig.source, sig.scraped_at)
+            db_signal_id = save_signal(sig)
             source_signals.append(sig)
 
-            signal_dict = {
-                "signal_id": str(uuid.uuid4()),
-                "source": sig.source,
-                "title": sig.title,
-                "url": sig.url,
-                "blurb": sig.blurb,
-                "scraped_at": sig.scraped_at,
-                "status": "queued",
-                "queue_index": len(state.signals),
-            }
+            signal_dict = signal_to_dict(sig, str(uuid.uuid4()), len(state.signals))
+            signal_dict["db_signal_id"] = db_signal_id
             state.signals.append(signal_dict)
             await emit_event("signal_queued", run_id, signal_dict, signal_id=signal_dict["signal_id"])
 
@@ -418,13 +400,8 @@ async def _execute_run(run_id: str, max_signals: int):
         )
 
         # Create Signal object for orchestrator
-        signal = Signal(
-            source=signal_dict["source"],
-            title=signal_dict["title"],
-            url=signal_dict["url"],
-            blurb=signal_dict["blurb"],
-            scraped_at=signal_dict["scraped_at"],
-        )
+        from council.scrape import dict_to_signal_from_dict
+        signal = dict_to_signal_from_dict(signal_dict)
 
         # Run Ideator
         state.active_cycle["ideator"] = {
@@ -487,6 +464,8 @@ async def _execute_run(run_id: str, max_signals: int):
 
         try:
             idea = await asyncio.to_thread(run_ideator, signal)
+            db_idea_id = save_idea(signal_dict["db_signal_id"], idea)
+            signal_dict["db_idea_id"] = db_idea_id
         except Exception as exc:
             error = {
                 "error_id": str(uuid.uuid4()),
@@ -555,6 +534,16 @@ async def _execute_run(run_id: str, max_signals: int):
 
         try:
             round1_results = await asyncio.to_thread(run_round1, idea)
+            # Save Round 1 lawyer statements to DB
+            for dim, result in round1_results.items():
+                save_lawyer_statement(
+                    idea_id=db_idea_id,
+                    dimension=dim,
+                    round_num=1,
+                    score=result["score"],
+                    argument=result["argument"],
+                    key_points=result["key_points"]
+                )
         except Exception as exc:
             await _emit_cycle_error(
                 run_id, cycle_id, signal_dict, "round1", f"Round 1 failed: {exc}"
@@ -592,6 +581,15 @@ async def _execute_run(run_id: str, max_signals: int):
 
         try:
             round2_results = await asyncio.to_thread(run_round2, idea, round1_results)
+            # Save Round 2 lawyer statements to DB
+            for dim, result in round2_results.items():
+                save_lawyer_statement(
+                    idea_id=db_idea_id,
+                    dimension=dim,
+                    round_num=2,
+                    score=result["updated_score"],
+                    argument=result["rebuttal"]
+                )
         except Exception as exc:
             await _emit_cycle_error(
                 run_id, cycle_id, signal_dict, "round2", f"Round 2 failed: {exc}"
@@ -614,7 +612,7 @@ async def _execute_run(run_id: str, max_signals: int):
                     "original_score": round1_results[dim]["score"],
                     "updated_score": result["updated_score"],
                     "rebuttal": result["rebuttal"],
-                },
+                   },
                 cycle_id=cycle_id,
                 signal_id=signal_dict["signal_id"]
             )
@@ -622,13 +620,15 @@ async def _execute_run(run_id: str, max_signals: int):
         # Run Judge
         try:
             verdict = await asyncio.to_thread(run_judge, idea, round1_results, round2_results)
+            # Save Verdict to DB (both saved and rejected)
+            save_verdict(verdict, verdict.debate_transcript, saved=1 if verdict.save else 0, idea_id=db_idea_id)
         except Exception as exc:
             await _emit_cycle_error(
                 run_id, cycle_id, signal_dict, "judge", f"Judge failed: {exc}"
             )
             continue
 
-        verdict_dict = verdict_to_dict(verdict)
+        verdict_dict = verdict.to_dict()
         state.active_cycle["judge"] = {
             "status": "complete",
             "verdict": verdict_dict,
@@ -714,7 +714,22 @@ async def _execute_scraping(run_id: str, max_signals: int):
 
     init_db()
 
-    for source, scraper_fn in SOURCE_SCRAPERS:
+    # Import scrapers here to avoid import-time issues
+    from council.scrape import (
+        scrape_github, scrape_hn, scrape_arxiv,
+        scrape_devto, scrape_lobsters, dict_to_signal
+    )
+    from council.db import is_signal_seen, mark_signal_seen
+
+    source_scrapers = [
+        ("GitHub", lambda: scrape_github(max_signals)),
+        ("Hacker News", lambda: scrape_hn()),
+        ("arXiv", lambda: scrape_arxiv(max_results=max_signals)),
+        ("DEV.to", lambda: scrape_devto(max_signals)),
+        ("Lobste.rs", lambda: scrape_lobsters(max_signals)),
+    ]
+
+    for source, scraper_fn in source_scrapers:
         if state.status == "stopping":
             await emit_event("run_stopped", run_id, {"section": "scraping"})
             state.status = "idle"
@@ -730,7 +745,7 @@ async def _execute_scraping(run_id: str, max_signals: int):
         }
         await emit_event("source_scrape_started", run_id, {"source": source})
 
-        raw_signals = await asyncio.to_thread(scraper_fn, max_signals)
+        raw_signals = await asyncio.to_thread(scraper_fn)
         source_signals = []
         duplicate_count = 0
 
@@ -744,24 +759,17 @@ async def _execute_scraping(run_id: str, max_signals: int):
             if not sig.url:
                 continue
 
-            url_hash = hashlib.sha256(sig.url.encode()).hexdigest()
+            url_hash = sig.url_hash()
             if is_signal_seen(url_hash):
                 duplicate_count += 1
                 continue
 
             mark_signal_seen(url_hash, sig.url, sig.source, sig.scraped_at)
+            db_signal_id = save_signal(sig)
             source_signals.append(sig)
 
-            signal_dict = {
-                "signal_id": str(uuid.uuid4()),
-                "source": sig.source,
-                "title": sig.title,
-                "url": sig.url,
-                "blurb": sig.blurb,
-                "scraped_at": sig.scraped_at,
-                "status": "queued",
-                "queue_index": len(state.signals),
-            }
+            signal_dict = signal_to_dict(sig, str(uuid.uuid4()), len(state.signals))
+            signal_dict["db_signal_id"] = db_signal_id
             state.signals.append(signal_dict)
             await emit_event("signal_queued", run_id, signal_dict, signal_id=signal_dict["signal_id"])
 
@@ -846,13 +854,8 @@ async def _execute_ideator(run_id: str):
             signal_id=signal_dict["signal_id"]
         )
 
-        signal = Signal(
-            source=signal_dict["source"],
-            title=signal_dict["title"],
-            url=signal_dict["url"],
-            blurb=signal_dict["blurb"],
-            scraped_at=signal_dict["scraped_at"],
-        )
+        from council.scrape import dict_to_signal_from_dict
+        signal = dict_to_signal_from_dict(signal_dict)
 
         # Run Ideator
         state.active_cycle["ideator"] = {
@@ -890,6 +893,10 @@ async def _execute_ideator(run_id: str):
 
         try:
             idea = await asyncio.to_thread(run_ideator, signal)
+            db_signal_id = signal_dict.get("db_signal_id") or save_signal(signal)
+            db_idea_id = save_idea(db_signal_id, idea)
+            signal_dict["db_signal_id"] = db_signal_id
+            signal_dict["db_idea_id"] = db_idea_id
         except Exception as exc:
             error = {
                 "error_id": str(uuid.uuid4()),
@@ -975,7 +982,24 @@ async def _execute_round1(run_id: str):
         try:
             from council.models import Idea
             idea = Idea.from_dict(idea_dict)
+            db_idea_id = signal_dict.get("db_idea_id")
+            if not db_idea_id:
+                from council.scrape import dict_to_signal_from_dict
+                db_signal_id = signal_dict.get("db_signal_id") or save_signal(dict_to_signal_from_dict(signal_dict))
+                db_idea_id = save_idea(db_signal_id, idea)
+                signal_dict["db_signal_id"] = db_signal_id
+                signal_dict["db_idea_id"] = db_idea_id
+
             round1_results = await asyncio.to_thread(run_round1, idea)
+            for dim, result in round1_results.items():
+                save_lawyer_statement(
+                    idea_id=db_idea_id,
+                    dimension=dim,
+                    round_num=1,
+                    score=result["score"],
+                    argument=result["argument"],
+                    key_points=result["key_points"]
+                )
         except Exception as exc:
             await _emit_cycle_error(run_id, cycle_id, signal_dict, "round1", f"Round 1 failed: {exc}")
             continue
@@ -1050,9 +1074,80 @@ async def _execute_round2(run_id: str):
         try:
             from council.models import Idea
             idea = Idea.from_dict(idea_dict)
+            db_idea_id = signal_dict.get("db_idea_id")
+            if not db_idea_id:
+                from council.scrape import dict_to_signal_from_dict
+                db_signal_id = signal_dict.get("db_signal_id") or save_signal(dict_to_signal_from_dict(signal_dict))
+                db_idea_id = save_idea(db_signal_id, idea)
+                signal_dict["db_signal_id"] = db_signal_id
+                signal_dict["db_idea_id"] = db_idea_id
+
             round2_results = await asyncio.to_thread(run_round2, idea, round1_results)
+            for dim, result in round2_results.items():
+                save_lawyer_statement(
+                    idea_id=db_idea_id,
+                    dimension=dim,
+                    round_num=2,
+                    score=result["updated_score"],
+                    argument=result["rebuttal"]
+                )
+
+            # Run and save Judge verdict
+            verdict = await asyncio.to_thread(run_judge, idea, round1_results, round2_results)
+            save_verdict(verdict, verdict.debate_transcript, saved=1 if verdict.save else 0, idea_id=db_idea_id)
+
+            verdict_dict = verdict.to_dict()
+            state.active_cycle["judge"] = {
+                "status": "complete",
+                "verdict": verdict_dict,
+                "completed_at": datetime.now().isoformat(),
+            }
+
+            await emit_event(
+                "judge_completed",
+                run_id,
+                {"verdict": verdict_dict},
+                cycle_id=cycle_id,
+                signal_id=signal_dict["signal_id"]
+            )
+
+            if verdict.save:
+                await emit_event(
+                    "verdict_saved",
+                    run_id,
+                    {"verdict": verdict_dict},
+                    cycle_id=cycle_id,
+                    signal_id=signal_dict["signal_id"]
+                )
+                signal_dict["status"] = "saved"
+                state.saved_ideas.append({
+                    "cycle_id": cycle_id,
+                    "signal_id": signal_dict["signal_id"],
+                    "signal": signal_dict,
+                    "idea": idea.to_dict(),
+                    "verdict": verdict_dict,
+                })
+            else:
+                await emit_event(
+                    "verdict_rejected",
+                    run_id,
+                    {"verdict": verdict_dict},
+                    cycle_id=cycle_id,
+                    signal_id=signal_dict["signal_id"]
+                )
+                signal_dict["status"] = "rejected"
+                state.rejected_ideas.append({
+                    "cycle_id": cycle_id,
+                    "signal_id": signal_dict["signal_id"],
+                    "signal": signal_dict,
+                    "idea": idea.to_dict(),
+                    "verdict": verdict_dict,
+                })
+
+            await emit_event("cycle_completed", run_id, {}, cycle_id=cycle_id, signal_id=signal_dict["signal_id"])
+
         except Exception as exc:
-            await _emit_cycle_error(run_id, cycle_id, signal_dict, "round2", f"Round 2 failed: {exc}")
+            await _emit_cycle_error(run_id, cycle_id, signal_dict, "round2", f"Round 2/Judge failed: {exc}")
             continue
 
         signal_dict["round2"] = round2_results

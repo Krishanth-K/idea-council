@@ -2,17 +2,38 @@
 
 from dataclasses import dataclass, field
 from datetime import datetime
+from enum import Enum
 from typing import Optional
+
+"""
+ insufficient_context
+The blurb/title are too thin, but a longer summary/article could plausibly help.
+
+not_project_material
+The signal is understandable, but it does not imply a useful solo-dev project.
+
+duplicative_or_obvious
+The likely idea is too generic, already saturated, or just a wrapper/dashboard with no interesting angle.
+
+out_of_scope
+The idea would require a company, large team, regulated deployment, specialized hardware, or unrealistic resources.
+"""
+class IdeatorSkipReason(str, Enum):
+  INSUFFICIENT_CONTEXT = "insufficient_context"
+  NOT_PROJECT_MATERIAL = "not_project_material"
+  DUPLICATIVE_OR_OBVIOUS = "duplicative_or_obvious"
+  OUT_OF_SCOPE = "out_of_scope"
 
 
 @dataclass
 class Signal:
     """A single signal scraped from a source."""
-    source: str
     title: str
+    source: str
+    scraped_at: str
     url: str
     blurb: str
-    scraped_at: str
+    summary: str = ""
 
     def url_hash(self) -> str:
         """SHA256 hash of the URL for deduplication."""
@@ -120,6 +141,18 @@ class Verdict:
         self.save = False
         return False
 
+    def to_dict(self) -> dict:
+        """Convert Verdict to dict for JSON serialization."""
+        return {
+            "idea_title": self.idea_title,
+            "one_liner": self.one_liner,
+            "scores": self.scores,
+            "weighted_score": self.weighted_score,
+            "save": self.save,
+            "summary": self.summary,
+            "debate_transcript": self.debate_transcript,
+        }
+
     @classmethod
     def from_dict(cls, data: dict) -> "Verdict":
         """Create Verdict from parsed JSON dict."""
@@ -130,7 +163,7 @@ class Verdict:
             weighted_score=data.get("weighted_score", 0.0),
             save=data.get("save", False),
             summary=data.get("summary", ""),
-            debate_transcript=""
+            debate_transcript=data.get("debate_transcript", "")
         )
 
 

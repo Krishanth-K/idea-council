@@ -3,24 +3,56 @@
 import hashlib
 from typing import List
 
+from council.db import init_db, is_signal_seen, mark_signal_seen
 from council.models import Signal
-from council.db import is_signal_seen, mark_signal_seen, init_db
-from council.scrape.hn import scrape_hn
 from council.scrape.arxiv import scrape_arxiv
 from council.scrape.devto import scrape_devto
 from council.scrape.github import scrape_github
+from council.scrape.hn import scrape_hn
 from council.scrape.lobsters import scrape_lobsters
+from council.logger import logger, setup_logger
 
 
 def dict_to_signal(d: dict) -> Signal:
     """Convert a scraper dict to a Signal dataclass."""
+
     blurb = d.get("blurb") or d.get("summary") or ""
+    _summary = d.get("summary", "")
+
     return Signal(
         source=d.get("source", "unknown"),
         title=d.get("title", ""),
         url=d.get("url", ""),
         blurb=blurb,
+        summary=_summary,
         scraped_at=d.get("scraped_at", "")
+    )
+
+
+def signal_to_dict(sig: Signal, signal_id: str = None, queue_index: int = None) -> dict:
+    """Convert a Signal dataclass to a dict for the server's state."""
+    return {
+        "signal_id": signal_id or "",
+        "source": sig.source,
+        "title": sig.title,
+        "url": sig.url,
+        "blurb": sig.blurb,
+        "summary": sig.summary,
+        "scraped_at": sig.scraped_at,
+        "status": "queued",
+        "queue_index": queue_index,
+    }
+
+
+def dict_to_signal_from_dict(d: dict) -> Signal:
+    """Convert a server signal dict back to a Signal dataclass."""
+    return Signal(
+        source=d.get("source", ""),
+        title=d.get("title", ""),
+        url=d.get("url", ""),
+        blurb=d.get("blurb", ""),
+        summary=d.get("summary", ""),
+        scraped_at=d.get("scraped_at", ""),
     )
 
 
@@ -29,6 +61,7 @@ def scrape_all(max_per_source: int = 30) -> List[Signal]:
     Scrape all sources and return deduplicated signals.
     Checks URL hashes against the seen_signals table.
     """
+    setup_logger()
     init_db()  # Ensure DB exists
 
     all_signals = []
@@ -65,9 +98,9 @@ def scrape_all(max_per_source: int = 30) -> List[Signal]:
                 all_signals.append(sig)
 
         except Exception as e:
-            print(f"Error scraping {source_name}: {e}")
+            logger.error(f"Error scraping {source_name}: {e}")
 
-    print(f"Scraped {len(all_signals)} new signals ({seen_count} duplicates skipped)")
+    logger.info(f"Scraped {len(all_signals)} new signals ({seen_count} duplicates skipped)")
     return all_signals
 
 
@@ -89,7 +122,8 @@ def batch_signals(signals: List[Signal]) -> str:
 
 if __name__ == "__main__":
     # Test run
+    setup_logger()
     signals = scrape_all(max_per_source=10)
-    print(f"\nTotal new signals: {len(signals)}")
-    print("\n--- BATCH OUTPUT ---\n")
-    print(batch_signals(signals[:3]))
+    logger.info(f"\nTotal new signals: {len(signals)}")
+    logger.info("\n--- BATCH OUTPUT ---\n")
+    logger.info(batch_signals(signals[:3]))

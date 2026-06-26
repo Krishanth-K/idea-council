@@ -49,12 +49,22 @@ Respond with ONLY the following JSON. No preamble, no explanation, no text after
 }
 ```
 
-If the signal is too weak or generic to produce a good idea,
-output this instead and nothing else:
+If the signal should be skipped, output this instead and nothing else:
 
 ```json
-{ "skip": true, "reason": "<one sentence why the signal was insufficient>" }
+{
+  "skip": true,
+  "reason": "<one of: insufficient_context, not_project_material, duplicative_or_obvious, out_of_scope>"
+}
 ```
+
+Use the skip reason enum exactly:
+- "insufficient_context": the title/blurb are too thin, but a longer summary or article could plausibly help.
+- "not_project_material": the signal is understandable, but it does not imply a useful solo-dev project.
+- "duplicative_or_obvious": the likely idea is too generic, saturated, or just a wrapper/dashboard with no interesting angle.
+- "out_of_scope": the idea would require a company, large team, regulated deployment, specialized hardware, or unrealistic resources.
+
+Do not invent other reason values. Do not use a full sentence in "reason".
 """
 
 # =============================================================================
