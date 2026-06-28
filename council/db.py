@@ -23,32 +23,7 @@ def init_db() -> None:
     conn = get_connection()
     cursor = conn.cursor()
 
-    # Ideas table (representing final verdicts)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS ideas (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            title           TEXT NOT NULL,
-            one_liner       TEXT,
-            scores          TEXT,
-            weighted_score  REAL,
-            saved           INTEGER,
-            summary         TEXT,
-            transcript      TEXT,
-            created_at      TEXT DEFAULT (datetime('now'))
-        )
-    """)
-
-    # Seen signals table (for deduplication)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS seen_signals (
-            url_hash    TEXT PRIMARY KEY,
-            url         TEXT,
-            source      TEXT,
-            scraped_at  TEXT
-        )
-    """)
-
-    # Signals table (stores full signal details)
+    # 1. Signals table (stores full signal details)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS signals (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -62,30 +37,44 @@ def init_db() -> None:
         )
     """)
 
-    # Pipeline Ideas table (stores generated ideas, skipped or not)
+    # 2. Seen signals table (for deduplication)
     cursor.execute("""
-        CREATE TABLE IF NOT EXISTS pipeline_ideas (
-            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-            signal_id           INTEGER REFERENCES signals(id),
-            title               TEXT,
-            one_liner           TEXT,
-            target_user         TEXT,
-            problem_it_solves   TEXT,
-            core_technical_challenge TEXT,
-            estimated_scope     TEXT,
-            skip                INTEGER, -- 0 or 1
-            skip_reason         TEXT,
-            created_at          TEXT DEFAULT (datetime('now'))
+        CREATE TABLE IF NOT EXISTS seen_signals (
+            url_hash    TEXT PRIMARY KEY,
+            url         TEXT,
+            source      TEXT,
+            scraped_at  TEXT
         )
     """)
 
-    # Lawyer statements table (R1 and R2 statements)
+    # 3. Ideas table (consolidated lifecycle representing raw + debated ideas)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS ideas (
+            id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+            signal_id               INTEGER REFERENCES signals(id),
+            title                   TEXT NOT NULL,
+            one_liner               TEXT,
+            target_user             TEXT,
+            problem_it_solves       TEXT,
+            core_technical_challenge TEXT,
+            estimated_scope         TEXT,
+            skip                    INTEGER DEFAULT 0, -- 0 or 1
+            skip_reason             TEXT,
+            debated                 INTEGER DEFAULT 0, -- 0 or 1
+            accepted_by_council     INTEGER DEFAULT 0, -- 0 or 1
+            created_at              TEXT DEFAULT (datetime('now'))
+        )
+    """)
+
+    # 4. Lawyer statements table (R1 and R2 statements)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS lawyer_statements (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            idea_id         INTEGER REFERENCES pipeline_ideas(id),
+            idea_id         INTEGER REFERENCES ideas(id),
             dimension       TEXT,
             round           INTEGER, -- 1 or 2
+            statement_type  TEXT, -- 'statement' or 'rebuttal'
+            against         TEXT, -- NULL or dimension rebutted
             score           INTEGER,
             argument        TEXT,
             key_points      TEXT, -- JSON list of strings (for round 1)
@@ -93,12 +82,18 @@ def init_db() -> None:
         )
     """)
 
-    # Ensure ideas table has the new columns if needed (backward compatibility migration)
-    try:
-        cursor.execute("ALTER TABLE ideas ADD COLUMN idea_id INTEGER REFERENCES pipeline_ideas(id)")
-    except sqlite3.OperationalError:
-        # Column already exists
-        pass
+    # 5. Verdicts table (stores final judge scoring/synthesis transcripts for accepted ideas)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS verdicts (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            idea_id             INTEGER UNIQUE REFERENCES ideas(id),
+            weighted_score      REAL,
+            scores              TEXT, -- JSON of dimension -> score
+            summary             TEXT, -- Judge synthesis
+            debate_transcript   TEXT, -- Full transcript
+            created_at          TEXT DEFAULT (datetime('now'))
+        )
+    """)
 
     conn.commit()
     conn.close()
@@ -169,10 +164,11 @@ def save_idea(signal_id: int, idea: Idea) -> int:
     cursor = conn.cursor()
     cursor.execute(
         """
-        INSERT INTO pipeline_ideas (
+        INSERT INTO ideas (
             signal_id, title, one_liner, target_user, problem_it_solves,
-            core_technical_challenge, estimated_scope, skip, skip_reason
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            core_technical_challenge, estimated_scope, skip, skip_reason,
+            debated, accepted_by_council
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0)
         """,
         (
             signal_id,
@@ -192,18 +188,32 @@ def save_idea(signal_id: int, idea: Idea) -> int:
     return idea_id
 
 
-def save_lawyer_statement(idea_id: int, dimension: str, round_num: int, score: int, argument: str, key_points: list[str] = None) -> int:
+def save_lawyer_statement(
+    idea_id: int,
+    dimension: str,
+    round_num: int,
+    score: int,
+    argument: str,
+    key_points: list[str] = None,
+    statement_type: Optional[str] = None,
+    against: Optional[str] = None,
+) -> int:
     """Save a lawyer statement (argument or rebuttal)."""
     conn = get_connection()
     cursor = conn.cursor()
     kp_json = json.dumps(key_points) if key_points else None
+    
+    # Infer statement type if not explicitly provided
+    if not statement_type:
+        statement_type = "statement" if round_num == 1 else "rebuttal"
+        
     cursor.execute(
         """
         INSERT INTO lawyer_statements (
-            idea_id, dimension, round, score, argument, key_points
-        ) VALUES (?, ?, ?, ?, ?, ?)
+            idea_id, dimension, round, statement_type, against, score, argument, key_points
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (idea_id, dimension, round_num, score, argument, kp_json)
+        (idea_id, dimension, round_num, statement_type, against, score, argument, kp_json)
     )
     statement_id = cursor.lastrowid
     conn.commit()
@@ -214,36 +224,63 @@ def save_lawyer_statement(idea_id: int, dimension: str, round_num: int, score: i
 def save_verdict(verdict: Verdict, full_transcript: str, saved: Optional[int] = None, idea_id: Optional[int] = None) -> int:
     """
     Save a verdict to the database.
-    Returns the inserted row ID.
+    Updates the ideas table and inserts into the verdicts table if accepted.
+    Returns the verdict ID if saved, or idea_id as fallback.
     """
     conn = get_connection()
     cursor = conn.cursor()
 
     is_saved = saved if saved is not None else (1 if verdict.save else 0)
 
-    cursor.execute(
-        """
-        INSERT INTO ideas (
-            title, one_liner, scores, weighted_score, saved, summary, transcript, idea_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            verdict.idea_title,
-            verdict.one_liner,
-            json.dumps(verdict.scores),
-            verdict.weighted_score,
-            is_saved,
-            verdict.summary,
-            full_transcript,
-            idea_id
+    # 1. Update the ideas table state
+    if idea_id is not None:
+        cursor.execute(
+            """
+            UPDATE ideas
+            SET debated = 1, accepted_by_council = ?
+            WHERE id = ?
+            """,
+            (is_saved, idea_id)
         )
-    )
+    else:
+        # Fallback: attempt to resolve idea_id via title
+        cursor.execute(
+            """
+            UPDATE ideas
+            SET debated = 1, accepted_by_council = ?
+            WHERE title = ? AND debated = 0
+            """,
+            (is_saved, verdict.idea_title)
+        )
+        cursor.execute("SELECT id FROM ideas WHERE title = ? ORDER BY id DESC LIMIT 1", (verdict.idea_title,))
+        row = cursor.fetchone()
+        if row:
+            idea_id = row["id"]
 
-    row_id = cursor.lastrowid
+    # 2. Insert into the verdicts table (if accepted/saved)
+    verdict_id = 0
+    if is_saved:
+        cursor.execute(
+            """
+            INSERT INTO verdicts (
+                idea_id, weighted_score, scores, summary, debate_transcript
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                idea_id,
+                verdict.weighted_score,
+                json.dumps(verdict.scores),
+                verdict.summary,
+                full_transcript
+            )
+        )
+        verdict_id = cursor.lastrowid
+
     conn.commit()
     conn.close()
 
-    return row_id
+    # Return the verdict_id (or idea_id as fallback) for backward compatibility
+    return verdict_id if verdict_id else (idea_id if idea_id else 0)
 
 
 def get_saved_ideas(limit: int = 20) -> list[dict]:
@@ -253,10 +290,10 @@ def get_saved_ideas(limit: int = 20) -> list[dict]:
 
     cursor.execute(
         """
-        SELECT id, title, one_liner, scores, weighted_score, summary, created_at
-        FROM ideas
-        WHERE saved = 1
-        ORDER BY weighted_score DESC, created_at DESC
+        SELECT i.id AS idea_id, v.id AS verdict_id, i.title, i.one_liner, v.scores, v.weighted_score, v.summary, v.created_at
+        FROM verdicts v
+        JOIN ideas i ON v.idea_id = i.id
+        ORDER BY v.weighted_score DESC, v.created_at DESC
         LIMIT ?
         """,
         (limit,)
@@ -268,7 +305,9 @@ def get_saved_ideas(limit: int = 20) -> list[dict]:
     results = []
     for row in rows:
         results.append({
-            "id": row["id"],
+            "id": row["idea_id"],  # Keep ID as ideas.id for backward compatibility
+            "idea_id": row["idea_id"],
+            "verdict_id": row["verdict_id"],
             "title": row["title"],
             "one_liner": row["one_liner"],
             "scores": json.loads(row["scores"]) if row["scores"] else {},
@@ -285,11 +324,19 @@ def get_idea_transcript(idea_id: int) -> Optional[str]:
     conn = get_connection()
     cursor = conn.cursor()
 
-    cursor.execute("SELECT transcript FROM ideas WHERE id = ?", (idea_id,))
+    # Query using either the idea_id (preferred) or the verdict_id (as fallback)
+    cursor.execute(
+        """
+        SELECT debate_transcript 
+        FROM verdicts 
+        WHERE idea_id = ? OR id = ?
+        """,
+        (idea_id, idea_id)
+    )
     row = cursor.fetchone()
     conn.close()
 
-    return row["transcript"] if row else None
+    return row["debate_transcript"] if row else None
 
 
 if __name__ == "__main__":
