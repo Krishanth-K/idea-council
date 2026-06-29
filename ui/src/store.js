@@ -701,7 +701,7 @@ const useStore = create((set, get) => ({
   },
 
   startScraping: async (maxSignals = 10) => {
-    const response = await fetch('/api/run/start-scraping', {
+    const response = await fetch('/api/run/scrape', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ max_signals: maxSignals })
@@ -710,18 +710,20 @@ const useStore = create((set, get) => ({
   },
 
   startIdeator: async () => {
-    const response = await fetch('/api/run/start-ideator', {
+    const response = await fetch('/api/run/ideator', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' }
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({})
     })
     return response.json()
   },
 
   startDebate: async () => {
     // Start Round 1 - debate is batch triggered
-    const response = await fetch('/api/run/start-round1', {
+    const response = await fetch('/api/run/round1', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' }
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({})
     })
     return response.json()
   },

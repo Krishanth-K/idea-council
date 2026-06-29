@@ -25,6 +25,7 @@ from council.phases import (
 )
 from council.server.events import manager, emit_event
 from council.state import state, new_run_id, PrerequisiteError
+from council.db import get_saved_ideas, get_idea_transcript
 
 app = FastAPI(title="IdeaCouncil API")
 
@@ -195,6 +196,55 @@ async def start_round2(request: dict) -> dict:
         return {"run_id": run_id, "status": "started", "section": "round2"}
     except PrerequisiteError as exc:
         return JSONResponse({"error": str(exc)}, status_code=400)
+
+
+# ---------------------------------------------------------------------------
+# Archive
+# ---------------------------------------------------------------------------
+
+@app.get("/api/archive")
+async def get_archive(limit: int = 200) -> dict:
+    """Return all saved ideas from the database for the archive view."""
+    ideas = get_saved_ideas(limit=limit)
+    saved = []
+    for idea in ideas:
+        saved.append({
+            "id": idea["idea_id"],
+            "idea_id": idea["idea_id"],
+            "verdict_id": idea["verdict_id"],
+            "title": idea["title"],
+            "one_liner": idea["one_liner"],
+            "scores": idea["scores"],
+            "weighted_score": idea["weighted_score"],
+            "summary": idea["summary"],
+            "created_at": idea["created_at"],
+            "saved": True,
+        })
+    return {"saved": saved, "rejected": []}
+
+
+@app.get("/api/archive/{idea_id}")
+async def get_archive_detail(idea_id: int) -> dict:
+    """Return full detail (including debate transcript) for one saved idea."""
+    ideas = get_saved_ideas(limit=1000)
+    match = next((i for i in ideas if i["idea_id"] == idea_id), None)
+    if not match:
+        return JSONResponse({"error": "not found"}, status_code=404)
+
+    transcript = get_idea_transcript(idea_id)
+    return {
+        "id": match["idea_id"],
+        "idea_id": match["idea_id"],
+        "verdict_id": match["verdict_id"],
+        "title": match["title"],
+        "one_liner": match["one_liner"],
+        "scores": match["scores"],
+        "weighted_score": match["weighted_score"],
+        "summary": match["summary"],
+        "created_at": match["created_at"],
+        "saved": True,
+        "transcript": transcript,
+    }
 
 
 # ---------------------------------------------------------------------------
