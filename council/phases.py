@@ -750,6 +750,10 @@ async def run_full(
 
         # Ideator
         idea = await _run_ideator_for_signal(on_event, run_id, cycle_id, signal_dict)
+        if state.status == "stopping":
+            await _emit(on_event, "run_stopped", run_id, {})
+            state.status = "idle"
+            return
         if idea is None:
             continue
 
@@ -758,6 +762,11 @@ async def run_full(
         signal_dict["db_idea_id"] = db_idea_id
 
         # Round 1
+        if state.status == "stopping":
+            await _emit(on_event, "run_stopped", run_id, {})
+            state.status = "idle"
+            return
+
         state.active_cycle["round1"] = {
             "status": "running", "lawyers": {},
             "started_at": datetime.now().isoformat(),
@@ -779,6 +788,11 @@ async def run_full(
             )
             continue
 
+        if state.status == "stopping":
+            await _emit(on_event, "run_stopped", run_id, {})
+            state.status = "idle"
+            return
+
         for dim, result in round1_results.items():
             state.active_cycle["round1"]["lawyers"][dim] = {
                 "score": result["score"],
@@ -794,6 +808,11 @@ async def run_full(
             )
 
         # Round 2
+        if state.status == "stopping":
+            await _emit(on_event, "run_stopped", run_id, {})
+            state.status = "idle"
+            return
+
         state.active_cycle["round2"] = {
             "status": "running", "lawyers": {},
             "started_at": datetime.now().isoformat(),
@@ -814,6 +833,11 @@ async def run_full(
             )
             continue
 
+        if state.status == "stopping":
+            await _emit(on_event, "run_stopped", run_id, {})
+            state.status = "idle"
+            return
+
         for dim, result in round2_results.items():
             state.active_cycle["round2"]["lawyers"][dim] = {
                 "original_score": round1_results[dim]["score"],
@@ -831,6 +855,11 @@ async def run_full(
             )
 
         # Judge
+        if state.status == "stopping":
+            await _emit(on_event, "run_stopped", run_id, {})
+            state.status = "idle"
+            return
+
         try:
             verdict = await asyncio.to_thread(
                 run_judge, idea, round1_results, round2_results

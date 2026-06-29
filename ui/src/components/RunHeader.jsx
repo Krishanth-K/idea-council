@@ -78,14 +78,14 @@ function RunHeader() {
           <button
             className="btn btn-primary"
             onClick={handleStartScraping}
-            disabled={isRunning || !isIdle}
+            disabled={!isIdle}
           >
             Start Scrape
           </button>
           <button
             className="btn btn-primary"
             onClick={handleStartIdeator}
-            disabled={isRunning || newSignals === 0}
+            disabled={!isIdle || newSignals === 0}
             title={newSignals === 0 ? 'No new signals to ideate' : ''}
           >
             Run Ideator {newSignals > 0 && `(${newSignals})`}
@@ -93,7 +93,7 @@ function RunHeader() {
           <button
             className="btn btn-primary"
             onClick={handleStartDebate}
-            disabled={isRunning || pendingDebateIdeas === 0}
+            disabled={!isIdle || pendingDebateIdeas === 0}
             title={pendingDebateIdeas === 0 ? 'No ideas pending debate' : ''}
           >
             Start Debate {pendingDebateIdeas > 0 && `(${pendingDebateIdeas})`}
@@ -104,7 +104,7 @@ function RunHeader() {
           <button
             className="btn btn-full-run"
             onClick={handleStart}
-            disabled={isRunning}
+            disabled={!isIdle}
           >
             Full Run
           </button>

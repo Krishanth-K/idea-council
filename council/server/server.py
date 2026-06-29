@@ -128,6 +128,7 @@ async def stop_run() -> dict:
     if not state.is_busy():
         return {"status": state.status, "message": "no run in progress"}
     state.request_stop()
+    await emit_event("run_stopping", state.run_id or "", {})
     return {"status": "stopping", "message": "stopping run…"}
 
 

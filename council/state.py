@@ -31,7 +31,7 @@ class AppState:
 
     def is_busy(self) -> bool:
         """Return True if a run is currently in progress."""
-        return self.status in {"scraping", "processing"}
+        return self.status in {"scraping", "processing", "stopping"}
 
     def request_stop(self) -> None:
         """Signal all running phase loops to stop gracefully."""

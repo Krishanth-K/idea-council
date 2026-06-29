@@ -655,6 +655,15 @@ const useStore = create((set, get) => ({
         })
         break
 
+      case 'run_stopping':
+        set({
+          run: {
+            ...state.run,
+            status: 'stopping'
+          }
+        })
+        break
+
       case 'run_stopped':
         set({
           run: {
